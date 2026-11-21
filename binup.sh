@@ -978,7 +978,7 @@ cockpit_package() {
 # snapshots also let an already-running command finish with its original files.
 install_latest() (
   local directory=${LAUNCHER%/*} store="${XDG_DATA_HOME:-$HOME/.local/share}/binup-runtime"
-  local temp archive digest release launcher="$directory/binup.sh" origin
+  local temp archive revision release prefix launcher="$directory/binup.sh" origin
   (( EUID != 0 )) || { fail 'Run install as the user who owns the apps.'; return 1; }
   if [[ -e $directory/.git ]] && command -v git >/dev/null; then
     origin=$(git -C "$directory" config --get remote.origin.url)
@@ -995,18 +995,22 @@ install_latest() (
   mkdir -p -- "$store" || return 1
   exec 8>"$store/install.lock" || return 1
   flock -n 8 || { fail 'Another Binup installation is running.'; return 1; }
-  temp=$(mktemp -d -- "$store/.install.XXXXXXXX") || return 1
-  trap 'rm -rf -- "$temp"' EXIT
-  archive=$temp/source.tar.gz
-  say 'Downloading Binup and its web interface.'
-  curl --proto '=https' --proto-redir '=https' -fsSL --retry 2 --connect-timeout 10 --max-time 120 \
-    -o "$archive" -- https://codeload.github.com/Whatevser/binup/tar.gz/refs/heads/main || return 1
-  digest=$(sha256sum < "$archive") || return 1
-  release=$store/${digest%% *}
+  revision=$(gh 'repos/Whatevser/binup/git/ref/heads/main' |
+    jq -er '.object | select(.type == "commit") | .sha | select(test("^[0-9a-f]{40}$"))') ||
+    { fail 'Could not read the current Binup commit from GitHub.'; return 1; }
+  release=$store/$revision
   if [[ ! -d $release ]]; then
+    say "Downloading Binup ${revision:0:7} and its web interface."
+    temp=$(mktemp -d -- "$store/.install.XXXXXXXX") || return 1
+    trap 'rm -rf -- "$temp"' EXIT
+    archive=$temp/source.tar.gz
+    curl --proto '=https' --proto-redir '=https' -fsSL --retry 2 --connect-timeout 10 --max-time 120 \
+      -o "$archive" -- "https://codeload.github.com/Whatevser/binup/tar.gz/$revision" || return 1
     mkdir -- "$temp/code" || return 1
-    tar -xzf "$archive" -C "$temp/code" --strip-components=1 -- binup-main/binup.sh binup-main/binup_web.py binup-main/web || return 1
-    bash -n "$temp/code/binup.sh" && mv -T -- "$temp/code" "$release" || return 1
+    prefix=binup-$revision
+    tar -xzf "$archive" -C "$temp/code" --strip-components=1 -- "$prefix/binup.sh" "$prefix/binup_web.py" "$prefix/web" || return 1
+    bash -n "$temp/code/binup.sh" && jq -e '."x-binup-package" == true' "$temp/code/web/manifest.json" >/dev/null &&
+      mv -T -- "$temp/code" "$release" || return 1
   fi
   bash "$release/binup.sh" web-install "$CONF" || return 1
   if [[ $directory != "$release" && $directory != "$store/"* ]]; then

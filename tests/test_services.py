@@ -27,7 +27,10 @@ def mock_command(tool, args):
     with (root / "calls").open("a") as stream:
         stream.write(json.dumps([tool, *args]) + "\n")
     if tool == "curl":
-        if args[-1].startswith("https://codeload.github.com/"):
+        if args[-1].endswith("/repos/Whatevser/binup/git/ref/heads/main"):
+            print(json.dumps({"object": {"type": "commit", "sha": (root / "main-revision").read_text()}}))
+        elif args[-1].startswith("https://codeload.github.com/"):
+            assert args[-1].rsplit("/", 1)[1] == (root / "main-revision").read_text()
             shutil.copyfile(root / "bundle.tar.gz", args[args.index("-o") + 1])
         elif "-o" in args:
             Path(args[args.index("-o") + 1]).write_bytes(PAYLOAD)
@@ -281,9 +284,11 @@ class ServiceTests(unittest.TestCase):
         before = live.read_bytes()
         bootstrap = loose / "binup-upgrade.sh"
         shutil.copyfile(ROOT / "binup.sh", bootstrap)
+        revision = "1" * 40
+        (self.root / "main-revision").write_text(revision)
         with tarfile.open(self.root / "bundle.tar.gz", "w:gz") as archive:
             for file in ("binup.sh", "binup_web.py", "web", "binup.json"):
-                archive.add(ROOT / file, "binup-main/" + file)
+                archive.add(ROOT / file, f"binup-{revision}/{file}")
         env = self.env.copy()
         del env["BINUP_CONF"]
         for script in (bootstrap, launcher):
@@ -298,6 +303,9 @@ class ServiceTests(unittest.TestCase):
         self.assertNotIn("--token-file", unit)
         self.assertFalse((launcher.resolve().parent / "binup.json").exists())
         installed = launcher.resolve()
+        self.assertEqual(installed.parent.name, revision)
+        self.assertEqual((self.root / "calls").read_text().count("https://codeload.github.com/"), 1)
+        (self.root / "main-revision").write_text("2" * 40)
         (self.root / "bundle.tar.gz").write_bytes(b"incomplete download")
         rejected = subprocess.run(["bash", str(launcher), "install"], env=env, capture_output=True)
         self.assertNotEqual(rejected.returncode, 0)
