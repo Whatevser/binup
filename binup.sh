@@ -7,7 +7,9 @@
 #   bash binup.sh check [NAME]     check one or all apps, without installing
 #   bash binup.sh update NAME      update one app (-f or --force to reinstall)
 #   bash binup.sh update all       update all apps, continuing after failures
-#   bash binup.sh list | remove NAME
+#   bash binup.sh list [--json] | remove NAME
+#   bash binup.sh status NAME | logs NAME [--follow] | service NAME start|stop|restart
+#   bash binup.sh web-install [CONFIG_PATH] | web-token | web-uninstall
 #
 # Pick a numbered file, enter r for a custom regex, or q to cancel. Terminal
 # updates reopen the picker if a rule matches zero or several release files.
@@ -20,7 +22,8 @@
 # check exits 0 if current, 10 if an update or baseline check is due, 1 on error.
 
 # Single-quoted filters passed to config/save_config contain jq variables.
-# shellcheck disable=SC2016
+# Helpers read the active transaction's local variables inside its subshell.
+# shellcheck disable=SC2016,SC2030,SC2031
 set -uo pipefail
 
 SELF=$(readlink -f -- "${BASH_SOURCE[0]}") || exit 1
@@ -40,20 +43,35 @@ case $(uname -m) in
   *)             ARCH_RE=$(uname -m) ;;
 esac
 
-as_root() { if (( EUID == 0 )); then "$@"; else sudo "$@"; fi; }
-
+as_root() {
+  if (( EUID == 0 )); then "$@"
+  elif [[ -n ${BINUP_WEB:-} ]]; then
+    command -v sudo >/dev/null || { fail 'This action needs sudo. Run it from the local CLI.'; return 1; }
+    local rc
+    if sudo -n -- "$@"; then return 0; else rc=$?; fi
+    warn 'If sudo needs a password, run this action from the local binup menu.'
+    return "$rc"
+  else sudo -- "$@"; fi
+}
+as_login() {
+  if (( EUID == 0 )) && [[ -n ${SUDO_USER:-} && $SUDO_USER != root ]]; then
+    sudo -H -u "$SUDO_USER" XDG_RUNTIME_DIR="/run/user/$(id -u "$SUDO_USER")" "$@"
+  else "$@"; fi
+}
 sctl() {
   local scope=$1
   shift
-  if [[ $scope == user ]]; then
-    if (( EUID == 0 )) && [[ -n ${SUDO_USER:-} ]]; then
-      sudo -u "$SUDO_USER" XDG_RUNTIME_DIR="/run/user/$(id -u "$SUDO_USER")" systemctl --user "$@"
-    else
-      systemctl --user "$@"
-    fi
+  if [[ $scope == user ]]; then as_login systemctl --user "$@"
   else
-    case $1 in start|stop|restart) as_root systemctl "$@" ;; *) systemctl "$@" ;; esac
+    case $1 in
+      start|stop|restart|enable|disable|daemon-reload) as_root systemctl "$@" ;;
+      *) systemctl "$@" ;;
+    esac
   fi
+}
+valid_service() {
+  local name=${1%.service} pattern='^([[:alnum:]_.:]|\\x[[:xdigit:]]{2})([[:alnum:]_.:@-]|\\x[[:xdigit:]]{2})*$'
+  [[ ( $2 == system || $2 == user ) && $name =~ $pattern && $name != *@ && ${#name} -le 247 ]]
 }
 
 # Every mutating command holds the same lock through selection, install and save.
@@ -83,13 +101,36 @@ field()     { jq -r --arg k "$2" '.[$k] // ""' <<< "$1"; }
 
 ask() {
   local label=$1 initial=${2:-}
-  if [[ -t 0 ]]; then
+  if [[ -n ${BINUP_PROMPT_FD:-} ]]; then
+    jq -nc --arg label "$label" --arg value "$initial" '{label:$label,default:$value}' >&"$BINUP_PROMPT_FD" || return 1
+    IFS= read -r REPLY
+  elif [[ -t 0 ]]; then
     IFS= read -er -i "$initial" -p "$label: " REPLY
   else
     printf '%s: ' "$label" >&2
     IFS= read -r REPLY || return 1
     REPLY=${REPLY:-$initial}
   fi
+}
+
+choice() {
+  local label=$1 initial=$2
+  if [[ -n ${BINUP_PROMPT_FD:-} ]]; then ask "$label" "$initial" || return 1
+  else
+    printf '%s%s: ' "$label" "${initial:+ [$initial]}" >&2
+    IFS= read -r REPLY || return 1
+  fi
+  REPLY=${REPLY:-$initial}
+}
+choose() {
+  local label=$1 initial=$2 value i=0
+  shift 2
+  for value in "$@"; do ((++i)); printf '  %d) %s\n' "$i" "$value" >&2; done
+  while choice "$label" "$initial"; do
+    if [[ $REPLY =~ ^[1-9][0-9]{0,7}$ ]] && (( REPLY <= $# )); then return 0; fi
+    warn 'Enter a listed number.'
+  done
+  return 1
 }
 
 find_services() {
@@ -101,7 +142,7 @@ find_services() {
     } 2>/dev/null | awk '{print $1}' | grep -iF -- "$1" | grep -v '@\.service$' | sort -u | sed "s/^/$scope /"
   done
 }
-svc_bin() { sctl "$1" show -p ExecStart --value -- "$2" 2>/dev/null | sed -n 's/.*path=\([^ ;]*\).*/\1/p' | head -1; }
+svc_bin() { sctl "$1" show -p ExecStart --value -- "$2" 2>/dev/null | sed -n 's/^.*path=\([^;]*[^; ]\) *;.*/\1/p' | head -1; }
 detect_version() {
   local bin=$1 arg out
   [[ -f $bin && -x $bin ]] || return 0
@@ -192,14 +233,13 @@ select_asset() {
   printf '%s\n%s\n' "$assets" "$matches" | jq -sr '
     (.[1] | INDEX(.name)) as $matched | .[0] | to_entries[] |
     "  \(.key+1)) \(.value.name)\(if $matched[.value.name] then "  [match]" else "" end)"' >&2 || return 1
-  if [[ $mode == check || ( $mode == update && ! -t 0 ) ]]; then
-    fail "Run update in a terminal to choose a file, or use edit to change the rule."
+  if [[ $mode == check || ( $mode == update && ! -t 0 && -z ${BINUP_PROMPT_FD:-} ) ]]; then
+    fail "Run Update in the menu or web UI to choose a file, or use Edit to change the rule."
     return 1
   fi
   while :; do
-    printf 'Build number%s (r = custom regex, q = cancel): ' "${default:+ [$default]}" >&2
-    IFS= read -r choice || return 1
-    choice=${choice:-$default}
+    choice 'Build number (r = custom regex, q = cancel)' "$default" || return 1
+    choice=$REPLY
     case $choice in
       q|Q) fail 'Selection cancelled.'; return 1 ;;
       r|R)
@@ -236,38 +276,124 @@ select_asset() {
   done
 }
 
-add_app() {
+# A unit always runs the foreground program directly. Split quoted arguments once,
+# then quote each systemd argument separately; no shell evaluates the command.
+unit_text() {
+  python3 - "$@" <<'PY'
+import os, pwd, shlex, sys
+unit, scope, directory, program, mode, *args = sys.argv[1:]
+try:
+    if mode == "split":
+        args = shlex.split(args[0])
+    if not os.path.isabs(program) or (directory != "~" and not os.path.isabs(directory)):
+        raise ValueError("use an absolute binary path and an absolute working directory (or ~)")
+    if any(any(ord(c) < 32 or ord(c) == 127 for c in value) for value in [unit, directory, program, *args]):
+        raise ValueError("control characters are not valid in a unit")
+    def quote(value):
+        return '"' + value.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%") + '"'
+    print("# Managed by binup\n[Unit]\nDescription=Binup - " + unit)
+    if mode == "split":
+        print("ConditionFileIsExecutable=" + program.replace("%", "%%"))
+    print("\n[Service]\nType=exec")
+    if scope == "system":
+        user = pwd.getpwnam(os.environ["SUDO_USER"]) if os.geteuid() == 0 and os.environ.get("SUDO_USER") else pwd.getpwuid(os.getuid())
+        print("User=" + str(user.pw_uid))
+    print("WorkingDirectory=" + directory.replace("%", "%%"))
+    # systemd's ':' prefix keeps dollar expressions literal, including in argv[0].
+    print("ExecStart=" + " ".join(map(quote, [":" + program, *args])))
+    print("Restart=always\nRestartSec=5s\n\n[Install]")
+    print("WantedBy=" + ("default.target" if scope == "user" else "multi-user.target"))
+except (ValueError, KeyError) as error:
+    sys.exit(f"Invalid service settings: {error}")
+PY
+}
+unit_dir() {
+  if [[ $1 == system ]]; then say /etc/systemd/system
+  elif (( EUID == 0 )) && [[ -n ${SUDO_USER:-} && $SUDO_USER != root ]]; then
+    as_login sh -c 'printf "%s/systemd/user\n" "${XDG_CONFIG_HOME:-$HOME/.config}"'
+  else say "${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"; fi
+}
+unit_fs() {
+  if [[ $scope == system ]]; then as_root "$@"; else as_login "$@"; fi
+}
+service_hint() {
+  printf 'Inspect the service with: bash %q status %q\n' "$SELF" "$app" >&2
+  printf 'Read recent errors with: bash %q logs %q\n' "$SELF" "$app" >&2
+}
+# The caller owns unit_created and staged_unit until registration commits.
+create_unit() {
+  local load dir unit=$svc.service
+  dir=$(unit_dir "$scope") || return 1
+  unit_file=$dir/$unit
+  load=$(sctl "$scope" show --property=LoadState --value -- "$unit") || [[ $load == not-found ]] || return 1
+  [[ $load == not-found && ! -e $unit_file && ! -L $unit_file ]] ||
+    { fail "$unit already exists or is masked in $scope scope. Choose an existing service."; return 1; }
+  unit_fs mkdir -p -- "$dir" || return 1
+  staged_unit=$(unit_fs mktemp -- "$dir/.binup-unit.XXXXXXXX") || return 1
+  unit_text "$unit" "$scope" "$working_dir" "$bin" split "$arguments" | unit_fs tee "$staged_unit" >/dev/null || return 1
+  unit_fs chmod 0644 -- "$staged_unit" || return 1
+  unit_fs ln -T -- "$staged_unit" "$unit_file" || return 1
+  unit_created=1
+  sctl "$scope" daemon-reload && sctl "$scope" enable -- "$unit"
+}
+
+add_app() (
   local app=${1:-} old bin svc scope ver repo rule channel tag_re member health release defaults picked=''
-  local services=()
+  local services=() create=0 staged_unit='' unit_file='' unit_created=0 saved=0 pending=false
+  local working_dir='~' arguments='' options=() cancelled=0
+  # shellcheck disable=SC2329
+  cleanup_add() {
+    if (( unit_created && ! saved )); then
+      sctl "$scope" disable -- "$svc.service" || warn "Could not disable $svc."
+      if ! unit_fs rm -f -- "$unit_file" || ! sctl "$scope" daemon-reload; then warn "Check the unit at $unit_file."; fi
+    fi
+    if [[ -n $staged_unit ]]; then unit_fs rm -f -- "$staged_unit"; fi
+  }
+  trap 'cleanup_add' EXIT
+  trap 'exit 130' INT TERM HUP
   if [[ -z $app ]]; then ask 'App name' || return 1; app=$REPLY; fi
-  [[ -n $app && $app != all && $app != *[[:cntrl:]]* ]] || { fail "Choose an app name other than 'all', without control characters."; return 1; }
+  [[ $app == *[![:space:]]* && $app != all && $app != -f && $app != --force && $app != *[[:cntrl:]]* ]] ||
+    { fail "Choose an app name without control characters. The names all, -f and --force are reserved."; return 1; }
   old=$(entry_for "$app") || return 1
   svc=$(field "$old" service); scope=$(field "$old" scope); scope=${scope:-system}
   bin=$(field "$old" bin); ver=$(field "$old" version); repo=$(field "$old" repo)
   rule=$(field "$old" asset_regex); channel=$(field "$old" release_channel); channel=${channel:-stable}
   tag_re=$(field "$old" tag_regex); member=$(field "$old" archive_member); health=$(field "$old" health_url)
 
-  if [[ $old == '{}' ]]; then
-    mapfile -t services < <(find_services "$app")
-    case ${#services[@]} in
-      0) picked='' ;;
-      1) picked=${services[0]} ;;
-      *) PS3='Pick service: '
-         select picked in "${services[@]}" '(none)'; do [[ -n $picked ]] && break; done
-         [[ $picked != '(none)' ]] || picked='' ;;
-    esac
-    if [[ -n $picked ]]; then
-      scope=${picked%% *}; svc=${picked#* }; svc=${svc%.service}; bin=$(svc_bin "$scope" "$svc")
-    fi
-    [[ -n $bin ]] || bin=$(type -P -- "$app")
-  fi
-  ask 'Service (blank = none)' "$svc" || return 1; svc=${REPLY%.service}
+  choose 'Service setup' 1 'Find or enter an existing service' 'Create a new service' 'No service' || return 1
+  case $REPLY in
+    1)
+      mapfile -t services < <(find_services "$app")
+      if [[ -n $svc ]]; then picked="$scope $svc"
+      elif (( ${#services[@]} == 1 )); then picked=${services[0]}
+      elif (( ${#services[@]} > 1 )); then
+        options=("${services[@]}" 'Enter a service name')
+        choose 'Existing service' '' "${options[@]}" || return 1
+        if (( REPLY <= ${#services[@]} )); then picked=${services[REPLY-1]}; fi
+      fi
+      if [[ -n $picked ]]; then scope=${picked%% *}; svc=${picked#* }; svc=${svc%.service}; fi
+      ask 'Service (blank = none)' "$svc" || return 1; svc=${REPLY%.service} ;;
+    2)
+      create=1; scope=user
+      ask 'New service name' "${svc:-$app}" || return 1; svc=${REPLY%.service}
+      [[ -n $svc ]] || { fail 'A new service needs a name.'; return 1; } ;;
+    3) svc='';;
+  esac
   if [[ -n $svc ]]; then
     ask 'Service scope (system/user)' "$scope" || return 1; scope=$REPLY
-    [[ $scope == system || $scope == user ]] || { fail 'Scope must be system or user.'; return 1; }
+    valid_service "$svc" "$scope" || { fail 'Enter one service name and a scope of system or user.'; return 1; }
+    if (( ! create )) && [[ -z $bin ]]; then bin=$(svc_bin "$scope" "$svc.service"); fi
   fi
+  [[ -n $bin ]] || bin=$(type -P -- "$app")
   ask 'Binary path' "$bin" || return 1; bin=${REPLY/#\~/$HOME}
   [[ -n $bin ]] || { fail 'A binary path is required.'; return 1; }
+  if (( create )); then
+    bin=$(realpath -ms -- "$bin") || return 1
+    ask 'Startup arguments (blank = none)' || return 1; arguments=$REPLY
+    ask 'Working directory (~ = service user home)' '~' || return 1; working_dir=$REPLY
+    say "Will enable $svc.service in $scope scope with automatic restart."
+    if [[ ! -f $bin || ! -x $bin ]]; then pending=true; say 'The first successful update will start it.'; fi
+  fi
   if [[ -z $ver && -x $bin ]]; then ver=$(detect_version "$bin"); fi
   ask 'Installed version (blank = unknown)' "$ver" || return 1; ver=$REPLY
   ask 'GitHub repo (owner/repo or URL)' "$repo" || return 1
@@ -289,15 +415,33 @@ add_app() {
   defaults=$(jq -cn --arg bin "$bin" --arg service "$svc" --arg scope "$scope" --arg version "$ver" \
     --arg repo "$repo" --arg asset_regex "$SELECTED_RULE" --arg release_channel "$channel" \
     --arg tag_regex "$tag_re" --arg archive_member "$member" --arg health_url "$health" '$ARGS.named') || return 1
-  save_config --arg n "$app" --argjson settings "$defaults" '
+  # Keep the unit and the registry in sync if interrupted between the two writes.
+  trap 'cancelled=1' INT TERM HUP
+  if (( create )); then create_unit || return 1; fi
+  (( ! cancelled )) || return 130
+  save_config --arg n "$app" --argjson settings "$defaults" --argjson pending "$pending" '
     .[$n] |= ((. // {}) as $old | $old + $settings
+      | if $pending then .start_after_install=true
+        elif any(["bin","service","scope"][]; $old[.] != $settings[.]) then del(.start_after_install) else . end
       | if any(["repo","bin","asset_regex","archive_member"][]; ($old[.] // "") != $settings[.])
         then del(.asset_sha256, .binary_sha256, .archive_selector) else . end
       | if .release_channel == "stable" then del(.release_channel) else . end
       | with_entries(select((.key == "tag_regex" or .key == "archive_member" or .key == "health_url")
                             and .value == "" | not)))' || return 1
+  saved=1
   ok "Saved '$app'."
-}
+  if (( cancelled )); then
+    if (( create )) && [[ $pending == false ]]; then say "Use List → $app → Start to start its new service."; fi
+    return 130
+  fi
+  trap 'exit 130' INT TERM HUP
+  if (( create )) && [[ $pending == false ]]; then
+    say "Starting $scope service $svc."
+    local interrupted=0
+    svc=$svc.service
+    start_checked || { service_hint; return 1; }
+  fi
+)
 
 file_kind() {
   case ${1,,} in
@@ -408,17 +552,19 @@ record_build() {
   save_config --arg n "$app" --arg tag "$tag" --arg rule "$SELECTED_RULE" \
     --arg asset "$asset_hash" --arg binary "$binary_hash" --arg selector "$archive_selector" '
     .[$n] |= (. + {version: $tag, asset_regex: $rule, asset_sha256: $asset, binary_sha256: $binary}
-      | if $selector == "" then del(.archive_selector) else .archive_selector = $selector end)'
+      | del(.start_after_install) | if $selector == "" then del(.archive_selector) else .archive_selector = $selector end)'
 }
 
 start_checked() {
   local deadline
+  say "Waiting for $scope service $svc to ${1:-start}."
   sctl "$scope" "${1:-start}" -- "$svc" || return 1
   if [[ -z $health ]]; then
     sleep 2
     sctl "$scope" is-active --quiet -- "$svc"
     return
   fi
+  say "Waiting for the HTTP health check for $svc."
   deadline=$((SECONDS + 30))
   while (( SECONDS < deadline )); do
     (( ! interrupted )) || return 130
@@ -433,22 +579,24 @@ start_checked() {
 
 install_build() (
   local source=$1 dir stage state had_old=0 was_active=0 stopped=0 swapped=0 committed=0 interrupted=0
-  local priv=()
+  local priv=() stop_requested=0 start_attempted=0
+  say "Staging the new binary and preparing the backup for $bin."
   dir=$(dirname -- "$bin")
   if [[ ! -d $dir ]]; then mkdir -p -- "$dir" 2>/dev/null || as_root mkdir -p -- "$dir" || return 1; fi
-  if (( EUID != 0 )) && [[ ! -w $dir || ( -e $bin && ! -O $bin ) ]]; then priv=(sudo); fi
+  if (( EUID != 0 )) && [[ ! -w $dir || ( -e $bin && ! -O $bin ) ]]; then priv=(as_root); fi
   stage=$("${priv[@]}" mktemp -d -- "$dir/.binup.XXXXXXXX") || return 1
 
   # shellcheck disable=SC2329  # Called by the subshell's EXIT trap.
   cleanup_install() {
-    local rc=$? restored=1 recovery=start
+    local rc=$? restored=1 recovery=start actual
+    if (( interrupted && ! committed )); then rc=130; fi
     trap - EXIT
     trap '' HUP INT TERM
     interrupted=0
     if (( rc != 0 && ! committed )); then
       if (( swapped )); then
         warn "Restoring the previous installation of $app."
-        if (( was_active )) && ! sctl "$scope" stop -- "$svc"; then
+        if (( start_attempted )) && ! sctl "$scope" stop -- "$svc"; then
           warn "Could not stop $svc. Will restart it after restoring the binary."
           recovery=restart
         fi
@@ -458,8 +606,22 @@ install_build() (
           "${priv[@]}" rm -f -- "$bin" || restored=0
         fi
       fi
-      if (( ! restored )); then warn "ROLLBACK FAILED for $bin. Check $bin.bak before starting $svc."
-      elif (( stopped )); then start_checked "$recovery" || warn "ROLLBACK FAILED to bring $svc back up."
+      if (( stop_requested && ! stopped )); then
+        actual=$(sctl "$scope" show --property=ActiveState --value -- "$svc") || actual=unknown
+        case $actual in
+          active|reloading) say "$svc is still active with the previous binary." ;;
+          inactive|failed) stopped=1 ;;
+          deactivating)
+            warn "$svc is still stopping. Requesting a start with the previous binary."
+            sctl "$scope" start --no-block -- "$svc" || warn "Could not queue the start for $svc."
+            service_hint ;;
+          *) warn "Stop did not complete. Current service state: $actual"; service_hint ;;
+        esac
+      fi
+      if (( ! restored )); then warn "Could not restore $bin. Inspect $bin.bak."; service_hint
+      elif (( stopped )); then
+        say "Bringing the previously active $svc back up."
+        start_checked "$recovery" || { warn "The previous binary is in place, but $svc did not pass its start check."; service_hint; }
       fi
     fi
     "${priv[@]}" rm -rf -- "$stage" || warn "Could not remove staging directory $stage."
@@ -478,11 +640,14 @@ install_build() (
   fi
   if [[ -n $svc ]]; then
     state=$(sctl "$scope" show --property=LoadState,ActiveState -- "$svc") || return 1
-    if ! grep -Eq '^LoadState=(loaded|masked)$' <<< "$state"; then fail "Could not load $scope service $svc."; return 1; fi
+    if ! grep -Eq '^LoadState=(loaded|masked)$' <<< "$state"; then
+      fail "Could not load $scope service $svc. Use Edit to find or create the correct unit."; return 1
+    fi
     case $'\n'$state$'\n' in
       *$'\nActiveState=active\n'*|*$'\nActiveState=reloading\n'*) was_active=1 ;;
       *$'\nActiveState=inactive\n'*|*$'\nActiveState=failed\n'*) ;;
-      *) fail "$svc is changing state. Retry after it settles."; return 1 ;;
+      *) fail "$svc is changing state. Inspect its status and logs. If it keeps restarting, stop it in List before retrying."
+         service_hint; return 1 ;;
     esac
     if (( was_active && ! had_old )); then
       fail "$svc is running and $bin is missing. Check its binary path before stopping it."
@@ -492,14 +657,22 @@ install_build() (
   if (( had_old )); then "${priv[@]}" mv -fT -- "$stage/old" "$bin.bak" || return 1; fi
   (( ! interrupted )) || return 130
   if (( was_active )); then
+    say "Stopping $scope service $svc and waiting for shutdown. An interrupt cancels the update after shutdown."
+    printf '  To watch the shutdown, open Logs in the web UI or run: bash %q logs %q --follow\n' "$SELF" "$app"
+    stop_requested=1
+    (trap '' INT HUP TERM; sctl "$scope" stop -- "$svc") ||
+      { fail "systemctl could not finish stopping $svc."; service_hint; return 1; }
     stopped=1
-    sctl "$scope" stop -- "$svc" || return 1
   fi
   (( ! interrupted )) || return 130
+  say "Replacing $bin."
   "${priv[@]}" mv -fT -- "$stage/new" "$bin" || { fail "Could not replace $bin."; return 1; }
   swapped=1
   if command -v restorecon >/dev/null; then "${priv[@]}" restorecon "$bin" || return 1; fi
-  if (( was_active )); then start_checked || { fail "$svc failed after installing $tag."; return 1; }; fi
+  if (( was_active )) || [[ $pending == true ]]; then
+    start_attempted=1
+    start_checked || { fail "$svc failed after installing $tag."; service_hint; return 1; }
+  fi
   (( ! interrupted )) || return 130
   record_build || { fail "Could not commit $CONF."; return 1; }
   committed=1
@@ -509,7 +682,8 @@ install_build() (
 process_app() (
   local mode=$1 app=$2 entry bin basename svc scope repo rule channel tag_re member health
   local release tag asset_hash binary_hash local_hash='' expected='' name kind url tmp payload reason
-  local previous saved_asset saved_binary saved_selector archive_selector=''
+  local previous saved_asset saved_binary saved_selector archive_selector='' pending interrupted=0
+  local progress=(-sS)
   entry=$(entry_for "$app") || return 1
   [[ $entry != '{}' ]] || { fail "'$app' is not registered."; return 1; }
   bin=$(field "$entry" bin); repo=$(field "$entry" repo)
@@ -518,10 +692,14 @@ process_app() (
   bin=$(realpath -m -- "$bin") || return 1
   if [[ -e $bin && ! -f $bin ]]; then fail "$bin is not a regular file."; return 1; fi
   svc=$(field "$entry" service); scope=$(field "$entry" scope); scope=${scope:-system}
-  if [[ -n $svc && $scope != system && $scope != user ]]; then fail "Invalid scope '$scope' for $svc."; return 1; fi
+  if [[ -n $svc ]]; then
+    valid_service "$svc" "$scope" || { fail "Invalid service '$svc' or scope '$scope'. Use Edit to correct it."; return 1; }
+    svc="${svc%.service}.service"
+  fi
   channel=$(field "$entry" release_channel); channel=${channel:-stable}
   rule=$(field "$entry" asset_regex); tag_re=$(field "$entry" tag_regex)
   member=$(field "$entry" archive_member); health=$(field "$entry" health_url)
+  pending=$(jq -r '(.start_after_install == true) and ((.service // "") != "")' <<< "$entry")
   previous=$(field "$entry" version); saved_asset=$(field "$entry" asset_sha256)
   saved_binary=$(field "$entry" binary_sha256); saved_selector=$(field "$entry" archive_selector)
 
@@ -544,7 +722,11 @@ process_app() (
 
   if [[ $local_hash && $local_hash == "$expected" && -x $bin ]] && [[ $mode == check || $FORCE == 0 ]]; then
     binary_hash=$local_hash
-    if [[ $mode == update && ( $previous != "$tag" || $saved_asset != "$asset_hash" || $saved_binary != "$binary_hash" || $rule != "$SELECTED_RULE" ) ]]; then
+    if [[ $pending == true ]]; then
+      if [[ $mode == check ]]; then say "$app is verified; $svc is awaiting its first start."; return 10; fi
+      start_checked || { service_hint; return 1; }
+    fi
+    if [[ $mode == update && ( $pending == true || $previous != "$tag" || $saved_asset != "$asset_hash" || $saved_binary != "$binary_hash" || $rule != "$SELECTED_RULE" ) ]]; then
       record_build || return 1
       ok "$app already has $tag. Saved the verified build details."
     else
@@ -557,16 +739,21 @@ process_app() (
   elif [[ $previous != "$tag" ]]; then reason="${previous:-unknown} → $tag"
   elif [[ -z $saved_asset && $kind != raw ]]; then reason='archive baseline needed'
   elif [[ -n $saved_asset && $saved_asset != "$asset_hash" ]]; then reason='release file changed under the same tag'
-  else reason='installed file needs verification or replacement'
+  elif [[ ! -x $bin ]]; then reason='installed file is not executable'
+  elif [[ -n $expected ]]; then reason="installed SHA-256 ${local_hash:0:12}… differs from expected ${expected:0:12}…"
+  else reason='archive contents need verification'
   fi
   say "  $tag / $name ($reason)"
   [[ $mode != check ]] || return 10
 
   tmp=$(mktemp -d) || return 1
   trap 'rm -rf -- "$tmp"' EXIT
-  curl --proto '=https' --proto-redir '=https' -fLsS --retry 2 --connect-timeout 10 --speed-time 60 --speed-limit 1 -o "$tmp/download" -- "$url" ||
+  say "Downloading $name."
+  if [[ -t 2 || -n ${BINUP_WEB:-} ]]; then progress=(--progress-bar -S); fi
+  curl --proto '=https' --proto-redir '=https' -fL "${progress[@]}" --retry 2 --connect-timeout 10 --speed-time 60 --speed-limit 1 -o "$tmp/download" -- "$url" ||
     { fail "$app: download failed for $name."; return 1; }
   local downloaded_hash
+  say 'Verifying SHA-256 and checking the executable.'
   downloaded_hash=$(hash_file "$tmp/download") || return 1
   [[ $downloaded_hash == "$asset_hash" ]] || { fail "$name: SHA-256 mismatch."; return 1; }
   payload=$tmp/binary
@@ -575,6 +762,7 @@ process_app() (
   binary_hash=$asset_hash
   if [[ $kind != raw ]]; then binary_hash=$(hash_file "$payload") || return 1; fi
   if (( ! FORCE )) && [[ $binary_hash == "$local_hash" && -x $bin ]]; then
+    if [[ $pending == true ]]; then start_checked || { service_hint; return 1; }; fi
     record_build || return 1
     ok "$app already has the verified binary for $tag. Build details saved."
   else
@@ -593,6 +781,7 @@ run_apps() {
     process_app "$mode" "$app"; rc=$?
     case $rc in
       0) ;;
+      129|130|143) warn 'Operation interrupted.'; return "$rc" ;;
       10) (( result != 0 )) || result=10 ;;
       *) result=1; failures+=("$app") ;;
     esac
@@ -601,13 +790,98 @@ run_apps() {
   return "$result"
 }
 
-list_apps() {
-  { printf 'NAME\tVERSION\tSERVICE\tBINARY\tREPO\n'
-    config -r 'to_entries[] | [.key, .value.version,
-      (if (.value.service // "") == "" then "" else "\(.value.service) (\(.value.scope // "system"))" end),
-      .value.bin, .value.repo] | map(if . == "" or . == null then "-" else . end) | @tsv'
-  } | if command -v column >/dev/null; then column -t -s $'\t'; else cat; fi
+list_data() {
+  local rows row svc scope unit properties key value load active sub result state
+  rows=$(config -c 'to_entries | sort_by(.key)[] |
+    {name:.key, version:(.value.version // ""), service:(.value.service // ""),
+     scope:(.value.scope // "system"), repo:.value.repo, bin:.value.bin,
+     pending:(.value.start_after_install == true)}') || return 1
+  while IFS= read -r row; do
+    [[ -n $row ]] || continue
+    svc=$(field "$row" service); scope=$(field "$row" scope)
+    state='no service'; sub=''; result=''; load=''; active=''
+    if [[ -n $svc ]] && ! valid_service "$svc" "$scope"; then
+      state='invalid service'
+    elif [[ -n $svc ]]; then
+      unit="${svc%.service}.service"
+      properties=$(sctl "$scope" show --property=LoadState,ActiveState,SubState,Result -- "$unit" 2>/dev/null) || :
+      while IFS='=' read -r key value; do
+        case $key in LoadState) load=$value ;; ActiveState) active=$value ;; SubState) sub=$value ;; Result) result=$value ;; esac
+      done <<< "$properties"
+      case $load in
+        loaded) state=${active:-unavailable} ;;
+        not-found) state=missing ;;
+        '') state=unavailable ;;
+        *) state=$load ;;
+      esac
+    fi
+    jq -c --arg state "$state" --arg sub "$sub" --arg result "$result" '. + {state:$state,sub:$sub,result:$result}' <<< "$row" || return 1
+  done <<< "$rows"
 }
+list_apps() {
+  local data
+  data=$(list_data | jq -s '.') || return 1
+  if [[ ${1:-} == --json ]]; then say "$data"; return; fi
+  jq -r '(["NAME","VERSION","SERVICE","SCOPE","STATE","BINARY","REPO"],
+    (.[] | [.name,.version,.service,(if .service != "" then .scope else "" end),
+    (.state + (if .state == "failed" and .result != "" then "/" + .result
+               elif .sub != "" and .state != "missing" then "/" + .sub
+                 + (if .sub == "auto-restart" and .result != "" then " (" + .result + ")" else "" end)
+               else "" end)
+            + (if .pending then " (awaiting install)" else "" end)),.bin,.repo]))
+    | map(if . == "" or . == null then "-" else . end) | @tsv' <<< "$data" |
+    if command -v column >/dev/null; then column -t -s $'\t'; else cat; fi
+}
+service_command() {
+  local app=$1 op=$2 entry svc scope unit health interrupted=0
+  local journal=(--no-pager -n 100 -o short-iso)
+  entry=$(entry_for "$app") || return 1
+  svc=$(field "$entry" service); scope=$(field "$entry" scope); scope=${scope:-system}
+  [[ -n $svc ]] || { fail "'$app' has no registered service."; return 1; }
+  valid_service "$svc" "$scope" || { fail "Invalid service '$svc' or scope '$scope'. Use Edit to correct it."; return 1; }
+  unit="${svc%.service}.service"
+  case $op in
+    status) sctl "$scope" status --no-pager --full -- "$unit" ;;
+    logs)
+      if [[ ${3:-} == --follow ]]; then journal+=(--follow); fi
+      if [[ $scope == user ]]; then as_login journalctl "--user-unit=$unit" "${journal[@]}"
+      else journalctl "--unit=$unit" "${journal[@]}"; fi ;;
+    start|restart|stop)
+      say "$op $scope service $unit"
+      if [[ $op == stop ]]; then sctl "$scope" stop -- "$unit" || { service_hint; return 1; }
+      else
+        health=$(field "$entry" health_url)
+        svc=$unit
+        start_checked "$op" || { service_hint; return 1; }
+      fi
+      if jq -e '.start_after_install == true' <<< "$entry" >/dev/null; then
+        save_config --arg n "$app" 'del(.[$n].start_after_install)' || return 1
+      fi
+      ok "$unit: $op completed." ;;
+    *) fail 'Use service NAME start, stop or restart.' ;;
+  esac
+}
+list_menu() {
+  local names=() keys app op
+  list_apps || return 1
+  keys=$(config -r 'to_entries | sort_by(.key)[] | select((.value.service // "") != "") | .key') || return 1
+  [[ -n $keys ]] || return 0
+  mapfile -t names <<< "$keys"
+  choose 'Inspect service or return' "$((${#names[@]} + 1))" "${names[@]}" Back || return 1
+  (( REPLY <= ${#names[@]} )) || return 0
+  app=${names[REPLY-1]}
+  while choose "$app service action" 7 'Status' 'Recent logs' 'Follow logs (Ctrl+C to leave)' 'Start' 'Restart' 'Stop' 'Back'; do
+    case $REPLY in
+      1) service_command "$app" status ;;
+      2) service_command "$app" logs ;;
+      3) (trap 'exit 130' INT; service_command "$app" logs --follow) ;;
+      4|5|6) case $REPLY in 4) op=start ;; 5) op=restart ;; 6) op=stop ;; esac
+             mutate service_command "$app" "$op" ;;
+      7) return 0 ;;
+    esac
+  done
+}
+
 remove_app() {
   config -e --arg n "$1" 'has($n)' >/dev/null || { fail "'$1' is not registered."; return 1; }
   save_config --arg n "$1" 'del(.[$n])' && ok "Removed '$1'."
@@ -629,20 +903,84 @@ menu() {
   local action REPLY
   while :; do
     PS3='binup> '
-    select action in 'Add app' 'Update one' 'Update all' 'Check for updates' 'List' 'Edit' 'Remove' 'Quit'; do break; done || return 0
+    select action in 'Add app' 'Update one' 'Update all' 'Check for updates' 'List' 'Edit' 'Remove' 'Quit' 'Web UI'; do break; done || return 0
     case $action in
       'Add app') mutate add_app ;;
       'Update one') pick_app && mutate run_apps update "$PICKED" ;;
       'Update all') mutate run_apps update all ;;
       'Check for updates') run_apps check all ;;
-      'List') list_apps ;;
+      'List') list_menu ;;
       'Edit') pick_app && mutate add_app "$PICKED" ;;
       'Remove') pick_app && mutate remove_app "$PICKED" ;;
+      'Web UI') web_menu ;;
       'Quit') return 0 ;;
       *) [[ $REPLY != q ]] || return 0 ;;
     esac
   done
 }
+
+web_menu() {
+  while choose 'Web UI action' 5 'Install or update the user service' 'Show access token' 'Show service status' 'Uninstall the web service' 'Back'; do
+    case $REPLY in
+      1) ask 'Registry file for the web UI' "$CONF" && bash "$SELF" web-install "$REPLY" ;;
+      2) web_setup web-token "$CONF" ;;
+      3) sctl user status --no-pager --full -- binup-web.service ;;
+      4) choice 'Remove the web user service? [y/N]' n && [[ $REPLY == [yY]* ]] && web_setup web-uninstall "$CONF" ;;
+      5) return 0 ;;
+    esac
+  done
+}
+
+web_setup() (
+  local action=$1 config_path=$2 folder unit path token draft='' load base=${SELF%/*} python existing=0
+  (( EUID != 0 )) || { fail 'Run web setup as the user who owns the apps.'; return 1; }
+  folder=$(unit_dir user) || return 1
+  unit=binup-web.service; path=$folder/$unit
+  token="${XDG_CONFIG_HOME:-$HOME/.config}/binup/web.token"
+  if [[ $action == web-token ]]; then
+    [[ -s $token ]] || { fail 'Run web-install to create the access token.'; return 1; }
+    cat -- "$token"; return
+  fi
+  if [[ -e $path || -L $path ]]; then
+    if [[ -L $path || ! -f $path ]] || ! grep -Fxq '# Generated by binup web-install' "$path"; then
+      fail "$path belongs to another service. Inspect it before installing."; return 1
+    fi
+    existing=1
+  elif [[ $action == web-uninstall ]]; then say 'Web unit is already absent.'; return 0
+  else
+    load=$(sctl user show --property=LoadState --value -- "$unit") || [[ $load == not-found ]] || return 1
+    [[ $load == not-found ]] || { fail "An existing user unit owns $unit."; return 1; }
+  fi
+  if [[ $action == web-uninstall ]]; then
+    sctl user disable --now -- "$unit" && rm -- "$path" && sctl user daemon-reload && ok 'Web service removed.'
+    return
+  fi
+  [[ -f $base/binup_web.py && -f $base/web/index.html && -f $base/web/app.js && -f $base/web/style.css ]] ||
+    { fail 'Run web-install from a checkout containing binup_web.py and the web directory.'; return 1; }
+  config_path=$(realpath -m -- "$config_path") || return 1
+  python=$(type -P python3) || return 1
+  "$python" "$base/binup_web.py" init-token --token-file "$token" || return 1
+  mkdir -p -- "$folder" || return 1
+  draft=$(mktemp -- "$folder/.binup-web.XXXXXXXX") || return 1
+  trap 'rm -f -- "$draft"' EXIT
+  {
+    say '# Generated by binup web-install'
+    unit_text "$unit" user '~' "$python" argv "$base/binup_web.py" serve --config "$config_path" --token-file "$token" || return 1
+    printf '\n[Service]\nKillMode=mixed\nTimeoutStopSec=5min\n'
+  } > "$draft" || return 1
+  chmod 0644 -- "$draft" || return 1
+  if (( existing )); then mv -fT -- "$draft" "$path" || return 1
+  else ln -T -- "$draft" "$path" || return 1; fi
+  if ! sctl user daemon-reload || ! sctl user enable -- "$unit" || ! sctl user restart -- "$unit"; then
+    fail "Web setup failed. Run journalctl --user-unit=$unit -n 50 --no-pager"; return 1
+  fi
+  sleep 1
+  sctl user is-active --quiet -- "$unit" ||
+    { fail "Web startup failed. Run journalctl --user-unit=$unit -n 50 --no-pager"; return 1; }
+  ok "Web UI listening on 0.0.0.0:9098. Open http://<server-IP>:9098/"
+  say "Config: $config_path"
+  say "Get your access token with: bash \"$SELF\" web-token"
+)
 
 FORCE=0
 args=()
@@ -651,6 +989,13 @@ for arg in "$@"; do
 done
 set -- "${args[@]}"
 case ${1:-} in -h|--help|help) sed -n '2,/^$/{ /^#/s/^# \{0,1\}//p; }' "$SELF"; exit 0 ;; esac
+case ${1:-} in
+  web-token|web-uninstall) web_setup "$1" "$CONF"; exit $? ;;
+  web-install)
+    if [[ -n ${2:-} ]]; then CONF=$(realpath -m -- "$2") || exit 1; fi
+    [[ -d ${CONF%/*} && -w ${CONF%/*} && ( ! -e $CONF || -f $CONF ) ]] ||
+      { warn "Choose a config file in a directory you can write: $CONF"; exit 1; } ;;
+esac
 for dep in curl jq flock python3 sha256sum; do
   command -v "$dep" >/dev/null || { warn "Missing dependency: $dep"; exit 1; }
 done
@@ -663,7 +1008,11 @@ case ${1:-} in
   edit)      [[ -n ${2:-} ]] && mutate add_app "$2" || exit 1 ;;
   check)     run_apps check "${2:-all}" ;;
   update)    mutate run_apps update "${2:-all}" ;;
-  list|ls)   list_apps ;;
+  list|ls)   list_apps "${2:-}" ;;
+  status|logs) [[ -n ${2:-} ]] || { warn "Use $1 NAME"; exit 1; }; service_command "$2" "$1" "${3:-}" ;;
+  service) [[ $# == 3 && $3 =~ ^(start|stop|restart)$ ]] || { warn 'Use service NAME start|stop|restart'; exit 1; }
+           mutate service_command "$2" "$3" ;;
+  web-install) web_setup "$1" "$CONF" ;;
   remove|rm) [[ -n ${2:-} ]] && mutate remove_app "$2" || exit 1 ;;
   *)         fail "Unknown command '$1'. Try --help." ;;
 esac
