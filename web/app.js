@@ -4,6 +4,20 @@ const $ = id => document.getElementById(id);
 const labels = {add: "Add", edit: "Edit", check: "Check", update: "Update", reinstall: "Reinstall",
                 remove: "Remove", start: "Start", stop: "Stop", restart: "Restart"};
 let api;
+// Only the initiating tab can answer an interactive run, including after a refresh.
+let ownedRun;
+function rememberRun(run, key) {
+  ownedRun = {id: run, key};
+  try {
+    if (key) sessionStorage.setItem("binup.run." + run, key);
+    else sessionStorage.removeItem("binup.run." + run);
+  } catch { /* In-memory access still works if browser storage is disabled. */ }
+}
+function ownerKey(run) {
+  if (ownedRun?.id === run) return ownedRun.key;
+  try { return sessionStorage.getItem("binup.run." + run); } catch { return null; }
+}
+
 const state = {connected: false, apps: [], runs: [], view: "apps",
                filter: "all", selected: null, cursor: -1, stream: null, text: "", replaceLine: false,
                prompt: null, workflow: null, dismissed: null, cleared: -1, journalSince: new Map(), settings: null, detail: null, detailMode: "logs", detailRequest: 0, refresh: 0, starting: false};
@@ -181,6 +195,7 @@ function reportConnection(error) {
   notify(error.message);
 }
 function clearRun() {
+  $("sudo-password").value = "";
   if (state.stream) state.stream.abort();
   state.stream = null;
   state.selected = state.prompt = null;
@@ -202,7 +217,8 @@ async function startRun(action, app) {
   notify();
   renderApps();
   try {
-    const run = await api("runs", {action, app});
+    const run = await api("runs", {action, app, interactive_sudo:window.isSecureContext});
+    if (run.owner) { rememberRun(run.id, run.owner); delete run.owner; }
     state.runs.unshift(run);
     selectRun(run.id, action !== "add" && action !== "edit");
     if (["add", "edit"].includes(action)) beginWorkflow(run);
@@ -249,6 +265,7 @@ function beginWorkflow(run, target = run.target) {
 }
 function showPrompt(prompt, run) {
   if (!prompt) {
+    $("sudo-password").value = "";
     $("reply").hidden = $("resume").hidden = true;
     if (state.workflow === run.id && run.code === null) {
       $("step-status").hidden = false;
@@ -257,18 +274,25 @@ function showPrompt(prompt, run) {
   } else if (state.prompt?.id !== prompt.id) {
     if (state.workflow !== run.id) beginWorkflow(run, prompt.app || run.target);
     else if (run.action === "update" || run.action === "reinstall") $("setup-title").textContent = "Select build for " + (prompt.app || run.target);
+    if (prompt.secret) $("setup-title").textContent = "Authorize " + runLabel(run);
     if (state.dismissed !== run.id) openSetup();
-    stepError();
+    stepError(prompt.retry ? "Sudo is asking again. Re-enter your password." : "");
     $("step-status").hidden = true;
     $("reply").hidden = false;
     $("resume").hidden = $("setup-dialog").open;
     $("prompt-label").textContent = prompt.label;
-    $("prompt-hint").textContent = prompt.hint;
+    $("prompt-hint").textContent = prompt.secret ?
+      [prompt.app, prompt.hint].filter(Boolean).join(" · ") : prompt.hint;
+    $("next-step").textContent = prompt.secret ? "Authorize" : "Continue";
+    $("resume").textContent = prompt.secret ? "Enter sudo password" : "Resume setup";
     const choices = prompt.options.length > 0;
-    const field = choices ? $("choice") : $("answer");
+    const field = prompt.secret ? $("sudo-password") : choices ? $("choice") : $("answer");
+    $("sudo-password").value = "";
     $("prompt-label").htmlFor = field.id;
-    $("answer").hidden = $("answer").disabled = choices;
-    $("choice").hidden = $("choice").disabled = !choices;
+    for (const id of ["answer", "choice", "sudo-password"]) {
+      const control = $(id);
+      control.hidden = control.disabled = control !== field;
+    }
     if (choices) {
       const options = prompt.options.map(o => typeof o === "string" ? new Option(o, o) : new Option(o.label, o.value));
       if (!options.some(o => o.value === prompt.default)) {
@@ -289,7 +313,7 @@ function finishWorkflow(run) {
   if (state.workflow !== run.id) return;
   $("stop-setup").hidden = $("step-status").hidden = true;
   if (run.code !== 0 && !run.cancelling) {
-    const errors = state.text.split("\n").filter(line => line.startsWith("! "));
+    const errors = state.text.split("\n").filter(line => line.startsWith("! ") || line.startsWith("sudo:"));
     stepError(errors.slice(-3).join("\n") || state.text.trim().split("\n").pop() || "Setup failed.");
   } else $("setup-dialog").close();
   state.workflow = null;
@@ -304,14 +328,14 @@ async function selectRun(id, scroll = false, reload = false) {
   state.stream = controller;
   while (!controller.signal.aborted) {
     try {
-      const run = await api("runs/" + id + "?after=" + state.cursor, undefined, controller.signal);
+      const run = await api("runs/" + id + "?after=" + state.cursor, undefined, controller.signal, ownerKey(id));
       if (controller.signal.aborted) return;
       if (state.cleared < run.cleared) { state.text = ""; state.replaceLine = false; }
       state.cleared = run.cleared;
       state.cursor = run.cursor;
       const status = runState(run);
       $("run-caption").hidden = false;
-      $("run-caption").textContent = runLabel(run);
+      $("run-caption").textContent = runLabel(run) + (run.waiting_for_owner ? " · Waiting for the tab that started this run" : "");
       $("clear-output").disabled = false;
       $("run-badge").textContent = status[0];
       $("run-badge").className = "badge " + status[1];
@@ -321,6 +345,7 @@ async function selectRun(id, scroll = false, reload = false) {
       showPrompt(run.prompt, run);
       if (run.code !== null) {
         finishWorkflow(run);
+        if (ownerKey(id)) rememberRun(id, null);
         const current = state.runs.find(item => item.id === id);
         if (current) Object.assign(current, {code:run.code, cancelling:run.cancelling});
         renderApps(); renderHistory();
@@ -397,6 +422,7 @@ async function cancelSelected() {
 $("cancel").addEventListener("click", cancelSelected);
 $("stop-setup").addEventListener("click", cancelSelected);
 $("setup-dialog").addEventListener("close", () => {
+  $("sudo-password").value = "";
   if (state.workflow) { state.dismissed = state.workflow; $("resume").hidden = !state.prompt; }
 });
 $("resume").addEventListener("click", () => { state.dismissed = null; $("resume").hidden = true; openSetup(); });
@@ -405,8 +431,13 @@ $("reply").addEventListener("submit", async e => {
   const prompt = state.prompt;
   if (!prompt || $("next-step").disabled) return;
   $("next-step").disabled = true;
-  const value = $(prompt.options.length ? "choice" : "answer").value;
-  try { await api("runs/" + state.selected + "/input", {id:prompt.id, value}); }
+  const field = $(prompt.secret ? "sudo-password" : prompt.options.length ? "choice" : "answer");
+  const value = field.value;
+  if (prompt.secret) field.value = "";
+  try {
+    const path = "runs/" + state.selected + (prompt.secret ? "/password" : "/input");
+    await api(path, {id:prompt.id, value}, undefined, ownerKey(state.selected));
+  }
   catch (error) {
     if (state.prompt?.id === prompt.id) { $("next-step").disabled = false; stepError(error.message); }
   }

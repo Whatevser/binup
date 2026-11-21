@@ -58,7 +58,7 @@
     <form id="add-form"><label for="new-name">App name</label><input id="new-name" placeholder="e.g. syncthing" required maxlength="255" autocomplete="off"><div class="form-actions"><button class="primary">Continue</button></div></form>
     <p id="step-status" role="status" hidden></p>
     <form id="reply" hidden><label id="prompt-label" for="answer">Setup</label><p id="prompt-hint"></p>
-      <input id="answer" aria-describedby="prompt-hint" autocomplete="off" spellcheck="false" maxlength="4096"><select id="choice" aria-describedby="prompt-hint" hidden></select>
+      <input id="answer" aria-describedby="prompt-hint" autocomplete="off" spellcheck="false" maxlength="4096"><input id="sudo-password" type="password" aria-describedby="prompt-hint" autocomplete="off" maxlength="4096" hidden disabled><select id="choice" aria-describedby="prompt-hint" hidden></select>
       <div class="form-actions"><button id="next-step" class="primary">Continue</button></div></form>
     <div id="step-error" role="alert" hidden></div>
     <button type="button" id="stop-setup" hidden>Cancel run</button>

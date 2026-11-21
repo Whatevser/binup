@@ -9,11 +9,12 @@ document.head.append(stylesheet);
 
 const http = window.cockpit.http(9098, {address: "127.0.0.1"});
 
-function request(path, body, signal) {
+function request(path, body, signal, owner) {
   if (signal?.aborted) return Promise.reject(new DOMException("Aborted", "AbortError"));
   const route = "/api/" + path;
-  const channel = body === undefined ? http.get(route) :
-    http.post(route, JSON.stringify(body), {"Content-Type": "application/json"});
+  const headers = owner ? {"X-Binup-Run":owner} : {};
+  const channel = body === undefined ? http.get(route, undefined, headers) :
+    http.post(route, JSON.stringify(body), {...headers, "Content-Type": "application/json"});
   const abort = () => channel.close("cancelled");
   signal?.addEventListener("abort", abort, {once: true});
   return new Promise((resolve, reject) => {

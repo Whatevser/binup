@@ -46,10 +46,28 @@ def mock_command(tool, args):
             signal.pause()
         return 0
     if tool == "sudo":
+        if (root / "password-required").exists():
+            if "-A" not in args:
+                print("sudo: a password is required", file=sys.stderr)
+                return 1
+            stamp = root / ("sudo-session-" + str(os.getsid(0)))
+            if not stamp.exists():
+                for _ in range(3):
+                    helper = subprocess.run([os.environ["SUDO_ASKPASS"], "Password for binup-test"],
+                                            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, timeout=12)
+                    if helper.returncode or not helper.stdout:
+                        return 1
+                    if helper.stdout == b"fixture-only password\n":
+                        stamp.touch()
+                        break
+                    print("Sorry, try again.", file=sys.stderr, flush=True)
+                else:
+                    return 1
         if (root / "deny-sudo").exists():
             print("sudo: a password is required", file=sys.stderr)
             return 1
-        command = [arg.replace("/etc/systemd/system", str(root / "system")) for arg in args if arg != "-n"]
+        command = args[args.index("--") + 1:] if "--" in args else args
+        command = [arg.replace("/etc/systemd/system", str(root / "system")) for arg in command]
         if command[0] == "--":
             command.pop(0)
         os.execvp(command[0], command)
@@ -174,7 +192,7 @@ class ServiceTests(unittest.TestCase):
         self.cli("logs", "demo")
         self.assertIn("--unit=" + UNIT, (self.root / "calls").read_text())
         (self.root / "deny-sudo").touch()
-        self.assertIn("local binup menu", self.cli("service", "demo", "stop", code=1, env=dict(self.env, BINUP_WEB="1")))
+        self.assertIn("Cockpit over HTTPS", self.cli("service", "demo", "stop", code=1, env=dict(self.env, BINUP_WEB="1")))
 
     def test_failed_setup_and_existing_unit(self):
         (self.root / "fail-enable").touch()
@@ -425,6 +443,51 @@ class ServiceTests(unittest.TestCase):
         self.api("history/clear", {})
         self.assertFalse(self.api("state")["runs"])
         self.assertIn("check", next(a for a in self.api("state")["apps"] if a["name"] == "old"))
+
+    def test_interactive_sudo(self):
+        self.binary.write_bytes(PAYLOAD)
+        self.binary.chmod(0o755)
+        self.create("system")
+        (self.root / "password-required").touch()
+        self.start_server("--bind", "127.0.0.1", "--port", "0")
+
+        def begin():
+            run = self.api("runs", {"action": "restart", "app": "demo", "interactive_sudo": True})
+            return "runs/" + run["id"], {"X-Binup-Run": run["owner"]}
+
+        def wait_for(path, headers, predicate):
+            result = self.api(path, **headers)
+            while not predicate(result):
+                self.assertIsNone(result["code"], result["output"])
+                result = self.api(path + "?after=" + str(result["cursor"]), **headers)
+            return result
+
+        path, headers = begin()
+        data = wait_for(path, headers, lambda r: r["prompt"])
+        prompt = data["prompt"]
+        self.assertTrue(prompt["secret"])
+        self.assertIsNone(self.api(path)["prompt"])
+        self.assertNotIn(headers["X-Binup-Run"], json.dumps(self.api("state")))
+        args = {"id": prompt["id"], "value": "wrong fixture password"}
+        for endpoint, auth, status in [("password", {}, 403), ("input", headers, 409)]:
+            with self.assertRaises(HTTPError) as error:
+                self.api(path + "/" + endpoint, args, **auth)
+            self.assertEqual(error.exception.code, status)
+        self.api(path + "/password", args, **headers)
+        second = wait_for(path, headers, lambda r: r["prompt"] and r["prompt"]["id"] != prompt["id"])
+        self.assertTrue(second["prompt"]["retry"])
+        self.api(path + "/password", {"id": second["prompt"]["id"], "value": "fixture-only password"}, **headers)
+        result = wait_for(path, headers, lambda r: r["code"] is not None)
+        self.assertEqual(result["code"], 0, self.api(path)["output"])
+        public = json.dumps([self.api(path), self.api("state")]) + (self.root / "calls").read_text()
+        self.assertNotIn("fixture-only password", public)
+        self.assertNotIn("wrong fixture password", public)
+        path, headers = begin()
+        wait_for(path, headers, lambda r: r["prompt"])
+        self.api(path + "/cancel", {}, **headers)
+        cancelled = wait_for(path, headers, lambda r: r["code"] is not None)
+        self.assertTrue(cancelled["cancelling"])
+        self.assertIsNone(cancelled["prompt"])
 
     def test_web_runs_repair_cancel_and_access(self):
         # A unit from before the token-free upgrade may still pass the old option.

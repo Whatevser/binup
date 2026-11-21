@@ -1,10 +1,10 @@
 import { start } from "./app.js";
 
-async function request(path, body, signal) {
-  const options = {cache: "no-store", signal};
+async function request(path, body, signal, owner) {
+  const options = {cache: "no-store", signal, headers:owner ? {"X-Binup-Run":owner} : {}};
   if (body !== undefined) {
     options.method = "POST";
-    options.headers = {"Content-Type": "application/json"};
+    options.headers["Content-Type"] = "application/json";
     options.body = JSON.stringify(body);
   }
   const response = await fetch("/api/" + path, options);

@@ -3,6 +3,7 @@
 import argparse
 import codecs
 from collections import deque
+from contextlib import ExitStack
 import fcntl
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -11,9 +12,11 @@ import json
 import os
 from pathlib import Path
 import secrets
+import select
 import selectors
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -90,12 +93,50 @@ class IPv6Server(LocalServer):
         super().server_bind()
 
 
+def sudo_askpass():
+    """Invoked by sudo -A. Only sudo reads this helper's stdout."""
+    directory = Path(os.environ["BINUP_ASKPASS_DIR"])
+    name = secrets.token_hex(16)
+    reply = directory / name
+    os.mkfifo(reply, 0o600)
+    try:
+        with ExitStack() as stack:
+            def open_pipe(path, flags, mode):
+                fd = os.open(path, flags | os.O_NONBLOCK)
+                return stack.enter_context(os.fdopen(fd, mode, buffering=0))
+            password = open_pipe(reply, os.O_RDONLY, "rb")
+            events = open_pipe(directory / "events", os.O_WRONLY, "wb")
+            # sudo closes inherited fds before starting askpass. Rejoin the run's
+            # event pipe by name and receive the answer through a fresh private FIFO.
+            info = dict(type="sudo", reply=name, sudo_pid=os.getppid(), label=sys.argv[1][:160],
+                        app=os.environ.get("BINUP_SUDO_APP", "")[:255], hint=os.environ.get("BINUP_SUDO_BIN", "")[:350])
+            events.write(json.dumps(info, ensure_ascii=False).encode() + b"\n")
+            try:
+                if not select.select([password], [], [], 120)[0]:
+                    sys.exit("The sudo password prompt timed out.")
+                os.set_blocking(password.fileno(), True)
+                answer = password.readline(4097)
+                if not answer.endswith(b"\n"):
+                    return 1
+                sys.stdout.buffer.write(answer)
+                return 0
+            finally:
+                events.write(json.dumps(dict(type="sudo_closed", reply=name)).encode() + b"\n")
+    finally:
+        reply.unlink(missing_ok=True)
+
+
 class Run:
     """One CLI process group. Prompts have a dedicated pipe and a single-use ID."""
-    def __init__(self, action, target, argv, env, on_result, scheduled=False):
+    def __init__(self, action, target, argv, env, on_result, scheduled=False, owner=None):
         self.id = secrets.token_hex(8)
         self.action, self.target = action, target
         self.scheduled = scheduled
+        self.owner = owner
+        self.password_pipe = None
+        self.last_sudo_pid = None
+        self.terminal = None
+        self.resources = ExitStack()
         self.on_result = on_result
         self.cleared = -1
         self.started = time.time()
@@ -106,19 +147,33 @@ class Run:
         self.discarded = -1
         self.events = deque()
         self.changed = threading.Condition()
-        reader, writer = os.pipe()
-        # The bash config lock uses fd 9. Pass an independent high fd.
-        prompt_fd = fcntl.fcntl(writer, fcntl.F_DUPFD_CLOEXEC, 50)
-        os.close(writer)
         try:
-            self.process = subprocess.Popen(["/bin/bash", SCRIPT, *argv], env=dict(env, BINUP_PROMPT_FD=str(prompt_fd)),
-                                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                            pass_fds=(prompt_fd,), start_new_session=True)
+            with ExitStack() as launch:
+                if owner:
+                    self.directory = Path(self.resources.enter_context(tempfile.TemporaryDirectory(prefix="binup-sudo-")))
+                    events = self.directory / "events"
+                    os.mkfifo(events, 0o600)
+                    master, slave = os.openpty()
+                    self.terminal = master
+                    self.resources.callback(os.close, master)
+                    self.resources.callback(os.close, slave)
+                    env = dict(env, BINUP_ASKPASS_DIR=str(self.directory), BINUP_SUDO_TTY=os.ttyname(slave))
+                    reader = os.open(events, os.O_RDONLY | os.O_NONBLOCK)
+                    self.resources.callback(os.close, reader)
+                    writer = os.open(events, os.O_WRONLY)
+                else:
+                    reader, writer = os.pipe()
+                    self.resources.callback(os.close, reader)
+                launch.callback(os.close, writer)
+                # The bash config lock uses fd 9. Pass an independent high fd.
+                prompt_fd = fcntl.fcntl(writer, fcntl.F_DUPFD_CLOEXEC, 50)
+                launch.callback(os.close, prompt_fd)
+                self.process = subprocess.Popen(["/bin/bash", SCRIPT, *argv], env=dict(env, BINUP_PROMPT_FD=str(prompt_fd)),
+                                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                                pass_fds=(prompt_fd,), start_new_session=True)
         except BaseException:
-            os.close(reader)
+            self.resources.close()
             raise
-        finally:
-            os.close(prompt_fd)
         self.thread = threading.Thread(target=self.watch, args=(reader,), name="binup-" + self.id)
         self.thread.start()
 
@@ -137,17 +192,57 @@ class Run:
                 self.discarded, old = self.events.popleft()
                 self.chars -= len(old)
 
+    def sudo_event(self, item):
+        name = item["reply"]
+        if not self.owner or len(name) != 32 or any(c not in "0123456789abcdef" for c in name):
+            return
+        with self.changed:
+            if item["type"] == "sudo_closed":
+                if self.password_pipe and self.password_request == name:
+                    self.close_password()
+                    self.prompt = None
+                    self.notify()
+                return
+            try:
+                fd = os.open(self.directory / name, os.O_WRONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+            except OSError:
+                return  # The helper has already exited.
+            if self.cancelling or self.prompt is not None or not stat.S_ISFIFO(os.fstat(fd).st_mode):
+                os.close(fd)
+                return
+            os.set_blocking(fd, True)
+            self.password_pipe = os.fdopen(fd, "wb", buffering=0)
+            self.password_request = name
+            self.notify()
+            self.prompt = dict(id=self.seq, secret=True, retry=item["sudo_pid"] == self.last_sudo_pid,
+                               label=item["label"] or "Sudo password",
+                               app=item["app"] or self.target, hint=item["hint"], options=[], default="", required=True)
+            self.last_sudo_pid = item["sudo_pid"]
+
+    def close_password(self):
+        if self.password_pipe is not None:
+            self.password_pipe.close()
+            self.password_pipe = None
+
     def watch(self, reader):
         decoder = codecs.getincrementaldecoder("utf-8")("replace")
         pending = b""
         try:
-            with os.fdopen(reader, "rb", buffering=0) as prompts, selectors.DefaultSelector() as selector:
+            with os.fdopen(reader, "rb", buffering=0, closefd=False) as prompts, selectors.DefaultSelector() as selector:
                 selector.register(self.process.stdout, selectors.EVENT_READ, "output")
                 selector.register(prompts, selectors.EVENT_READ, "prompt")
-                while selector.get_map():
+                if self.terminal is not None:
+                    selector.register(self.terminal, selectors.EVENT_READ, "terminal")
+                open_pipes = 2
+                while open_pipes:
                     for key, _ in selector.select():
                         data = os.read(key.fd, 8192)
+                        if key.data == "terminal":
+                            # PAM may write diagnostics on the controlling tty. Passwords
+                            # use the private FIFO. Keep tty chatter out of the transcript.
+                            continue
                         if not data:
+                            open_pipes -= 1
                             selector.unregister(key.fileobj)
                             if key.data == "output":
                                 self.append(decoder.decode(b"", final=True))
@@ -163,6 +258,8 @@ class Run:
                                         self.on_result(self.action, item)
                                     except OSError as exc:
                                         self.append(f"\n! Could not save check result: {exc}\n")
+                                elif item.get("type") in ("sudo", "sudo_closed"):
+                                    self.sudo_event(item)
                                 else:
                                     with self.changed:
                                         self.notify()
@@ -173,6 +270,8 @@ class Run:
         finally:
             code = self.process.wait()
             with self.changed:
+                self.close_password()
+                self.resources.close()
                 self.process.stdout.close()
                 self.process.stdin.close()
                 self.code = code
@@ -184,12 +283,17 @@ class Run:
             return dict(id=self.id, action=self.action, target=self.target, started=self.started,
                         code=self.code, cancelling=self.cancelling, scheduled=self.scheduled, cleared=self.cleared)
 
-    def poll(self, cursor):
+    def owns(self, key):
+        return self.owner is None or bool(key and key.isascii() and secrets.compare_digest(self.owner, key))
+
+    def poll(self, cursor, owner=None):
         with self.changed:
             if self.seq == cursor and self.code is None:
                 self.changed.wait_for(lambda: self.seq != cursor or self.code is not None, 12)
             return dict(self.summary(), cursor=self.seq, truncated=cursor < self.discarded,
-                        output="".join(text for number, text in self.events if number > cursor), prompt=self.prompt)
+                        output="".join(text for number, text in self.events if number > cursor),
+                        prompt=self.prompt if self.owns(owner) else None,
+                        waiting_for_owner=bool(self.prompt and not self.owns(owner)))
 
     def clear_output(self):
         with self.changed:
@@ -199,12 +303,28 @@ class Run:
             self.notify()
             self.cleared = self.seq
 
-    def answer(self, prompt_id, value):
+    def answer(self, prompt_id, value, secret=False):
         if not isinstance(value, str) or len(value.encode()) > 4096 or any(ord(c) < 32 or ord(c) == 127 for c in value):
             raise RequestError(400, "Enter one line, up to 4096 bytes.")
         with self.changed:
             if self.cancelling or self.code is not None or not self.prompt or self.prompt["id"] != prompt_id:
                 raise RequestError(409, "This prompt has already closed. Read the current output.")
+            if bool(self.prompt.get("secret")) != secret:
+                raise RequestError(409, "The input type does not match the current prompt.")
+            if secret:
+                if self.password_pipe is None:
+                    raise RequestError(409, "The sudo prompt has closed.")
+                if value == "":
+                    raise RequestError(400, "Enter the sudo password.")
+                try:
+                    self.password_pipe.write(value.encode() + b"\n")
+                except OSError:
+                    raise RequestError(409, "The sudo prompt has closed.") from None
+                finally:
+                    self.close_password()
+                    self.prompt = None
+                    self.notify()
+                return
             options = self.prompt.get("options", [])
             if options and value not in [o if isinstance(o, str) else o["value"] for o in options]:
                 raise RequestError(400, "Choose one of the listed options.")
@@ -223,6 +343,7 @@ class Run:
             if self.code is not None or self.cancelling:
                 return
             self.cancelling = True
+            self.close_password()
             self.prompt = None
             self.append("\n! Cancellation requested. Waiting for the command to finish recovery.\n")
             try:
@@ -237,7 +358,8 @@ class Control:
         self.config = config
         self.env = dict(os.environ, BINUP_CONF=str(config), BINUP_WEB="1", TERM="dumb",
                         SYSTEMD_PAGER="cat", SYSTEMD_COLORS="0", SYSTEMD_ASK_PASSWORD_AGENT="0")
-        self.env.pop("BINUP_PROMPT_FD", None)
+        for key in ("BINUP_PROMPT_FD", "BINUP_SUDO_TTY", "BINUP_ASKPASS_DIR"):
+            self.env.pop(key, None)
         self.lock = threading.Lock()
         self.runs = {}
         self.stopping = False
@@ -366,7 +488,7 @@ class Control:
             raise RequestError(404, "Application is no longer registered.")
         return value
 
-    def begin(self, body):
+    def begin(self, body, local=False):
         action = body.get("action")
         if action not in ("add", "edit", "check", "update", "reinstall", "remove", "start", "stop", "restart"):
             raise RequestError(400, "Unknown action.")
@@ -382,10 +504,16 @@ class Control:
                 raise RequestError(409, "A command is already running. Open its live output.")
             if action == "add" and self.web["checks"].pop(target, None) is not None:
                 self.save_web()
-            return self.start_locked(action, target, argv)
+            interactive = local and body.get("interactive_sudo") is True and action not in ("check", "remove")
+            owner = secrets.token_urlsafe(32) if interactive else None
+            result = self.start_locked(action, target, argv, owner=owner)
+            # Only the initiating response contains this per-run capability.
+            if owner:
+                result["owner"] = owner
+            return result
 
-    def start_locked(self, action, target, argv, scheduled=False):
-        run = Run(action, target, argv, self.env, self.record_check, scheduled)
+    def start_locked(self, action, target, argv, scheduled=False, owner=None):
+        run = Run(action, target, argv, self.env, self.record_check, scheduled, owner)
         if len(self.runs) >= HISTORY_LIMIT:
             del self.runs[next(iter(self.runs))]
         self.runs[run.id] = run
@@ -452,6 +580,11 @@ class Handler(BaseHTTPRequestHandler):
         if self.headers.get("Sec-Fetch-Site") == "cross-site":
             raise RequestError(403, "Open Binup directly or through Cockpit.")
         control = self.server.control
+        peer = ipaddress.ip_address(self.client_address[0])
+        if isinstance(peer, ipaddress.IPv6Address) and peer.ipv4_mapped:
+            peer = peer.ipv4_mapped
+        local = peer.is_loopback
+        owner = self.headers.get("X-Binup-Run", "") if local else ""
         if method == "GET" and path == "/api/state":
             return control.state()
         if method == "GET" and path in ("/api/logs", "/api/status"):
@@ -473,17 +606,21 @@ class Handler(BaseHTTPRequestHandler):
             self.body()
             return {"since": time.time_ns() // 1000}
         if method == "POST" and path == "/api/runs":
-            return control.begin(self.body())
+            return control.begin(self.body(), local)
         parts = path.strip("/").split("/")
         if len(parts) in (3, 4) and parts[:2] == ["api", "runs"]:
             run = control.lookup(parts[2])
             if method == "GET" and len(parts) == 3:
                 cursor = int(query.get("after", ["-1"])[0])
-                return run.poll(cursor)
+                return run.poll(cursor, owner)
             if method == "POST" and len(parts) == 4:
+                if parts[3] in ("input", "password") and not run.owns(owner):
+                    raise RequestError(403, "Use the browser tab that started this run.")
+                if parts[3] == "password" and not (local and run.owner):
+                    raise RequestError(403, "Use Cockpit over HTTPS or a localhost connection.")
                 body = self.body()
-                if parts[3] == "input":
-                    run.answer(body.get("id"), body.get("value"))
+                if parts[3] in ("input", "password"):
+                    run.answer(body.get("id"), body.get("value"), secret=parts[3] == "password")
                     return {"ok": True}
                 if parts[3] == "clear":
                     run.clear_output()
@@ -556,6 +693,8 @@ def main():
 
 if __name__ == "__main__":
     try:
+        if len(sys.argv) == 2 and os.environ.get("BINUP_ASKPASS_DIR"):
+            sys.exit(sudo_askpass())
         main()
     except (OSError, ValueError) as error:
         sys.exit(str(error))

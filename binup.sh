@@ -33,6 +33,13 @@ LAUNCHER=$(realpath -ms -- "${BASH_SOURCE[0]}") || exit 1
 CONF=$(realpath -m -- "${BINUP_CONF:-${LAUNCHER%/*}/binup.json}") || exit 1
 API=https://api.github.com
 
+# The web runner is a new session leader. Acquiring its private terminal gives
+# sudo one timestamp for this run, including commands inside Bash subshells.
+if [[ -n ${BINUP_SUDO_TTY:-} && -n ${BINUP_ASKPASS_DIR:-} ]]; then
+  : < "$BINUP_SUDO_TTY" || exit 1
+  unset BINUP_SUDO_TTY
+fi
+
 say()  { printf '%s\n' "$*"; }
 ok()   { printf '✓ %s\n' "$*"; }
 warn() { printf '! %s\n' "$*" >&2; }
@@ -50,9 +57,14 @@ as_root() {
   if (( EUID == 0 )); then "$@"
   elif [[ -n ${BINUP_WEB:-} ]]; then
     command -v sudo >/dev/null || { fail 'This action needs sudo. Run it from the local CLI.'; return 1; }
+    if [[ -n ${BINUP_ASKPASS_DIR:-} ]]; then
+      SUDO_ASKPASS="${SELF%/*}/binup_web.py" BINUP_SUDO_APP="${app:-}" BINUP_SUDO_BIN="${bin:-}" \
+        sudo -A -p 'Password for %p' -- "$@"
+      return
+    fi
     local rc
     if sudo -n -- "$@"; then return 0; else rc=$?; fi
-    warn 'If sudo needs a password, run this action from the local binup menu.'
+    warn 'If sudo needs a password, open Binup in Cockpit over HTTPS or through localhost and retry.'
     return "$rc"
   else sudo -- "$@"; fi
 }
