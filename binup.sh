@@ -102,10 +102,13 @@ save_config() (
 entry_for() { config -ec --arg n "$1" '.[$n] // {}'; }
 field()     { jq -r --arg k "$2" '.[$k] // ""' <<< "$1"; }
 
+# The web form also accepts choices, help text, a required flag and a display label.
 ask() {
   local label=$1 initial=${2:-}
   if [[ -n ${BINUP_PROMPT_FD:-} ]]; then
-    jq -nc --arg label "$label" --arg value "$initial" '{label:$label,default:$value}' >&"$BINUP_PROMPT_FD" || return 1
+    jq -c --arg label "${6:-$label}" --arg value "$initial" --arg app "${app:-}" \
+      --arg hint "${4:-}" --argjson required "${5:-false}" \
+      '{label:$label,app:$app,default:$value,options:.,hint:$hint,required:$required}' <<< "${3:-[]}" >&"$BINUP_PROMPT_FD" || return 1
     IFS= read -r REPLY
   elif [[ -t 0 ]]; then
     IFS= read -er -i "$initial" -p "$label: " REPLY
@@ -128,6 +131,13 @@ choice() {
 choose() {
   local label=$1 initial=$2 value i=0
   shift 2
+  if [[ -n ${BINUP_PROMPT_FD:-} ]]; then
+    local options
+    options=$(printf '%s\n' "$@" | jq -Rs 'split("\n")[:-1] | to_entries |
+      map({value:((.key+1)|tostring),label:.value})') || return 1
+    ask "$label" "$initial" "$options" '' true
+    return
+  fi
   for value in "$@"; do ((++i)); printf '  %d) %s\n' "$i" "$value" >&2; done
   while choice "$label" "$initial"; do
     if [[ $REPLY =~ ^[1-9][0-9]{0,7}$ ]] && (( REPLY <= $# )); then return 0; fi
@@ -217,7 +227,7 @@ matching_assets() {
 
 # Sets SELECTED_ASSET and SELECTED_RULE from the same release used for the menu.
 select_asset() {
-  local mode=$1 release=$2 rule=$3 tag assets matches count total default='' choice name proposed
+  local mode=$1 release=$2 rule=$3 tag assets matches count total default='' choice name proposed options hint
   tag=$(field "$release" tag_name)
   assets=$(jq -ce '[.assets[] | select(.state == "uploaded")]' <<< "$release") || return 1
   total=$(jq length <<< "$assets")
@@ -233,24 +243,32 @@ select_asset() {
   else
     warn "$tag has $count matches for ${rule:-automatic Linux / CPU detection}."
   fi
-  printf '%s\n%s\n' "$assets" "$matches" | jq -sr '
-    (.[1] | INDEX(.name)) as $matched | .[0] | to_entries[] |
-    "  \(.key+1)) \(.value.name)\(if $matched[.value.name] then "  [match]" else "" end)"' >&2 || return 1
+  if [[ -n ${BINUP_PROMPT_FD:-} && $mode != check ]]; then
+    options=$(jq -c 'to_entries | map({value:((.key+1)|tostring),label:.value.name})
+      + [{value:"r",label:"Enter a custom matching rule…"}]' <<< "$assets") || return 1
+    hint="Release $tag. Choose the file for this machine."
+    if (( count != 1 )); then hint="Release $tag. $count files match the current rule. Choose the correct build."; fi
+  else
+    printf '%s\n%s\n' "$assets" "$matches" | jq -sr '
+      (.[1] | INDEX(.name)) as $matched | .[0] | to_entries[] |
+      "  \(.key+1)) \(.value.name)\(if $matched[.value.name] then "  [match]" else "" end)"' >&2 || return 1
+  fi
   if [[ $mode == check || ( $mode == update && ! -t 0 && -z ${BINUP_PROMPT_FD:-} ) ]]; then
     fail "Run Update in the menu or web UI to choose a file, or use Edit to change the rule."
     return 1
   fi
   while :; do
-    choice 'Build number (r = custom regex, q = cancel)' "$default" || return 1
+    if [[ -n ${BINUP_PROMPT_FD:-} ]]; then ask 'Release build' "$default" "$options" "$hint" true || return 1
+    else choice 'Build number (r = custom regex, q = cancel)' "$default" || return 1; fi
     choice=$REPLY
     case $choice in
       q|Q) fail 'Selection cancelled.'; return 1 ;;
       r|R)
         ask 'Asset regex ({tag} is the release tag, {version} drops its leading v)' "$rule" || return 1
         proposed=$REPLY
-        matches=$(matching_assets "$assets" "$proposed" "$tag") || continue
+        matches=$(matching_assets "$assets" "$proposed" "$tag") || { hint="Invalid matching rule. Choose a build or edit the rule."; continue; }
         count=$(jq length <<< "$matches")
-        if (( count != 1 )); then warn "That rule matches $count files. Choose one file or refine the rule."; continue; fi
+        if (( count != 1 )); then hint="That rule matches $count files. Choose one file or refine the rule."; warn "$hint"; continue; fi
         SELECTED_ASSET=$(jq -c '.[0]' <<< "$matches")
         SELECTED_RULE=$proposed
         ;;
@@ -378,17 +396,17 @@ add_app() (
       ask 'Service (blank = none)' "$svc" || return 1; svc=${REPLY%.service} ;;
     2)
       create=1; scope=user
-      ask 'New service name' "${svc:-$app}" || return 1; svc=${REPLY%.service}
+      ask 'New service name' "${svc:-$app}" '[]' '' true || return 1; svc=${REPLY%.service}
       [[ -n $svc ]] || { fail 'A new service needs a name.'; return 1; } ;;
     3) svc='';;
   esac
   if [[ -n $svc ]]; then
-    ask 'Service scope (system/user)' "$scope" || return 1; scope=$REPLY
+    ask 'Service scope (system/user)' "$scope" '["user","system"]' '' true 'Service scope' || return 1; scope=$REPLY
     valid_service "$svc" "$scope" || { fail 'Enter one service name and a scope of system or user.'; return 1; }
     if (( ! create )) && [[ -z $bin ]]; then bin=$(svc_bin "$scope" "$svc.service"); fi
   fi
   [[ -n $bin ]] || bin=$(type -P -- "$app")
-  ask 'Binary path' "$bin" || return 1; bin=${REPLY/#\~/$HOME}
+  ask 'Binary path' "$bin" '[]' '' true || return 1; bin=${REPLY/#\~/$HOME}
   [[ -n $bin ]] || { fail 'A binary path is required.'; return 1; }
   if (( create )); then
     bin=$(realpath -ms -- "$bin") || return 1
@@ -399,14 +417,15 @@ add_app() (
   fi
   if [[ -z $ver && -x $bin ]]; then ver=$(detect_version "$bin"); fi
   ask 'Installed version (blank = unknown)' "$ver" || return 1; ver=$REPLY
-  ask 'GitHub repo (owner/repo or URL)' "$repo" || return 1
+  ask 'GitHub repo (owner/repo or URL)' "$repo" '[]' '' true || return 1
   repo=$(sed -E 's#^(https?://)?(www\.)?github\.com/##; s#/*$##; s#\.git$##' <<< "$REPLY" | cut -d/ -f1,2)
   [[ $repo =~ ^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$ ]] || { fail 'Invalid GitHub repository.'; return 1; }
 
   say "Channel $channel, tag filter ${tag_re:-any}, archive member ${member:-auto}, health URL ${health:-none}"
-  ask 'Change these settings? [y/N]' || return 1
+  ask 'Change these settings? [y/N]' '' '[{"value":"","label":"Keep current settings"},{"value":"y","label":"Change settings"}]' \
+    "Channel: $channel · Tag filter: ${tag_re:-any} · Archive member: ${member:-auto} · Health URL: ${health:-none}" false 'Release settings' || return 1
   if [[ $REPLY == [yY] || $REPLY == [yY][eE][sS] ]]; then
-    ask 'Release channel (stable/prerelease/any)' "$channel" || return 1; channel=$REPLY
+    ask 'Release channel (stable/prerelease/any)' "$channel" '["stable","prerelease","any"]' '' true 'Release channel' || return 1; channel=$REPLY
     ask 'Tag regex (blank = any tag)' "$tag_re" || return 1; tag_re=$REPLY
     ask 'Archive member (blank = auto)' "$member" || return 1; member=$REPLY
     ask 'Health URL (blank = systemd only)' "$health" || return 1; health=$REPLY
@@ -683,8 +702,19 @@ install_build() (
 )
 
 process_app() (
-  local mode=$1 app=$2 entry bin basename svc scope repo rule channel tag_re member health
-  local release tag asset_hash binary_hash local_hash='' expected='' name kind url tmp payload reason
+  local mode=$1 app=$2 entry='' tag='' reason='' tmp='' rc
+  process_build; rc=$?
+  if [[ -n ${BINUP_PROMPT_FD:-} && $rc != 130 && $rc != 143 && $rc != 129 && -n $entry ]]; then
+    if [[ $mode == update && $rc == 0 ]]; then entry=$(entry_for "$app") || return 1; fi
+    jq -nc --arg app "$app" --arg tag "$tag" --arg reason "$reason" --argjson entry "$entry" --argjson code "$rc" \
+      '{type:"result",app:$app,tag:$tag,reason:$reason,entry:$entry,code:$code}' >&"$BINUP_PROMPT_FD" || return 1
+  fi
+  return "$rc"
+)
+
+process_build() {
+  local bin basename svc scope repo rule channel tag_re member health
+  local release asset_hash binary_hash local_hash='' expected='' name kind url payload
   local previous saved_asset saved_binary saved_selector archive_selector='' pending interrupted=0
   local progress=(-sS)
   entry=$(entry_for "$app") || return 1
@@ -726,7 +756,7 @@ process_app() (
   if [[ $local_hash && $local_hash == "$expected" && -x $bin ]] && [[ $mode == check || $FORCE == 0 ]]; then
     binary_hash=$local_hash
     if [[ $pending == true ]]; then
-      if [[ $mode == check ]]; then say "$app is verified; $svc is awaiting its first start."; return 10; fi
+      if [[ $mode == check ]]; then reason="Service awaiting first start"; say "$app is verified; $svc is awaiting its first start."; return 10; fi
       start_checked || { service_hint; return 1; }
     fi
     if [[ $mode == update && ( $pending == true || $previous != "$tag" || $saved_asset != "$asset_hash" || $saved_binary != "$binary_hash" || $rule != "$SELECTED_RULE" ) ]]; then
@@ -771,7 +801,7 @@ process_app() (
   else
     install_build "$payload"
   fi
-)
+}
 
 run_apps() {
   local mode=$1 target=${2:-all} keys app rc result=0 names=() failures=()
@@ -846,7 +876,8 @@ service_command() {
   case $op in
     status) sctl "$scope" status --no-pager --full -- "$unit" ;;
     logs)
-      if [[ ${3:-} == --follow ]]; then journal+=(--follow); fi
+      if [[ ${3:-} == --follow ]]; then journal+=(--follow)
+      elif [[ ${3:-} =~ ^--since=@[0-9]{1,12}\.[0-9]{6}$ ]]; then journal+=(--quiet "$3"); fi
       if [[ $scope == user ]]; then as_login journalctl "--user-unit=$unit" "${journal[@]}"
       else journalctl "--unit=$unit" "${journal[@]}"; fi ;;
     start|restart|stop)

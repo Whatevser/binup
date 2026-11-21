@@ -6,7 +6,7 @@ const labels = {add: "Add", edit: "Edit", check: "Check", update: "Update", rein
 let api;
 const state = {connected: false, apps: [], runs: [], view: "apps",
                filter: "all", selected: null, cursor: -1, stream: null, text: "", replaceLine: false,
-               prompt: null, detail: null, detailMode: "logs", detailRequest: 0, refresh: 0, starting: false};
+               prompt: null, workflow: null, dismissed: null, cleared: -1, journalSince: new Map(), settings: null, detail: null, detailMode: "logs", detailRequest: 0, refresh: 0, starting: false};
 
 function element(tag, text, css) {
   const node = document.createElement(tag);
@@ -49,7 +49,9 @@ function toggleView(view) {
   state.view = view;
   $("apps-view").hidden = view !== "apps";
   $("history-view").hidden = view !== "history";
-  for (const v of ["apps", "history"]) {
+  $("settings-view").hidden = view !== "settings";
+  document.querySelector(".output").hidden = view === "settings";
+  for (const v of ["apps", "history", "settings"]) {
     const tab = $("nav-" + v);
     tab.classList.toggle("active", view === v);
     if (v === view) tab.setAttribute("aria-current", "page");
@@ -61,11 +63,32 @@ function cell(row, text, css) {
   row.append(td);
   return td;
 }
+function versionCell(row, app) {
+  const check = app.check;
+  const current = check?.status === "current";
+  const available = check?.status === "available";
+  const latest = check?.latest;
+  // A digest can confirm the actual installed build even when a legacy registry tag is missing.
+  const td = cell(row, (current ? latest : app.version) || "Unknown", "version " +
+    (current ? "good" : available ? "bad" : check ? "waiting" : "muted"));
+  let label = "Not checked";
+  if (current) label = "Up to date";
+  else if (available && check.reason === "binary missing") label = "Install " + latest;
+  else if (available && latest !== app.version) label = "Update to " + latest;
+  else if (available) label = "Verification needed";
+  else if (check) label = check.problem || "Check failed";
+  if (available && check.problem) label += " · " + check.problem;
+  td.append(element("small", label));
+  if (check) td.title = ["Checked " + new Date(check.checked * 1000).toLocaleString(), check.reason].filter(Boolean).join(" · ");
+}
+function runLabel(run) {
+  return (run.scheduled ? "Scheduled check" : labels[run.action]) + " · " + run.target;
+}
 function renderApps() {
   const term = $("search").value.trim().toLowerCase();
   const visible = state.apps.filter(app => {
     if (state.filter === "active" && app.state !== "active") return false;
-    if (state.filter === "issues" && serviceState(app)[1] !== "bad") return false;
+    if (state.filter === "issues" && serviceState(app)[1] !== "bad" && !["available", "error"].includes(app.check?.status)) return false;
     return [app.name, app.repo, app.service].some(s => (s || "").toLowerCase().includes(term));
   });
   const rows = document.createDocumentFragment();
@@ -75,7 +98,7 @@ function renderApps() {
     const row = element("tr");
     const name = cell(row);
     name.append(element("strong", app.name), element("small", app.repo || ""));
-    cell(row, app.version || "Unknown", "version");
+    versionCell(row, app);
     const unit = cell(row, app.service || "—");
     if (app.service) unit.append(element("small", app.scope + " service"));
     const status = cell(row);
@@ -113,10 +136,11 @@ function renderApps() {
   for (const id of ["start-unit", "restart-unit", "stop-unit"]) $(id).disabled = locked;
 }
 function renderHistory() {
+  $("clear-history").disabled = !state.runs.some(run => run.code !== null);
   const rows = state.runs.map(run => {
     const row = button("", () => selectRun(run.id, true));
     row.className = "history-row";
-    row.append(element("strong", labels[run.action] + " · " + run.target), badge(runState(run)),
+    row.append(element("strong", runLabel(run)), badge(runState(run)),
                element("time", new Date(run.started * 1000).toLocaleString()));
     return row;
   });
@@ -129,15 +153,23 @@ async function refreshState() {
   const data = await api("state");
   if (seq !== state.refresh) return;
   const previous = JSON.stringify(state.apps), wasBusy = busy();
+  const lastRun = state.runs[0]?.id;
   if (!state.connected) notify();
   state.connected = true;
   state.apps = data.apps;
   state.runs = data.runs;
+  if (!state.settings || state.settings.interval_hours !== data.settings.interval_hours)
+    $("interval").value = String(data.settings.interval_hours);
+  showSettings(data.settings);
   // Keep open row menus and keyboard focus during an ordinary status refresh.
   if (previous !== JSON.stringify(state.apps) || wasBusy !== busy() || !$("apps").childElementCount) renderApps();
   renderHistory();
   if (state.selected && !state.runs.some(r => r.id === state.selected)) clearRun();
-  if (!state.selected && state.runs.length) selectRun(state.runs[0].id);
+  const selected = state.runs.find(r => r.id === state.selected);
+  if (selected && selected.code !== null && selected.cleared > state.cleared) selectRun(selected.id, false, true);
+  const latest = state.runs[0];
+  if (latest && (!state.selected || (latest.id !== lastRun && state.selected === lastRun && state.view === "apps")))
+    selectRun(latest.id);
   $("connection").textContent = "Connected";
   $("connection").classList.remove("offline");
 }
@@ -152,6 +184,10 @@ function clearRun() {
   if (state.stream) state.stream.abort();
   state.stream = null;
   state.selected = state.prompt = null;
+  state.workflow = state.dismissed = null;
+  state.cleared = -1;
+  $("resume").hidden = true;
+  $("clear-output").disabled = true;
   state.text = "";
   state.replaceLine = false;
   $("reply").hidden = $("cancel").hidden = $("run-caption").hidden = true;
@@ -168,10 +204,12 @@ async function startRun(action, app) {
   try {
     const run = await api("runs", {action, app});
     state.runs.unshift(run);
-    selectRun(run.id, true);
+    selectRun(run.id, action !== "add" && action !== "edit");
+    if (["add", "edit"].includes(action)) beginWorkflow(run);
     renderHistory();
   } catch (error) {
-    notify(error.message);
+    if ($("setup-dialog").open) stepError(error.message);
+    else notify(error.message);
     refreshState().catch(reportConnection);
   } finally { state.starting = false; renderApps(); }
 }
@@ -189,21 +227,76 @@ function appendOutput(text, truncated) {
     state.text += part;
   }
   state.text = state.text.slice(-262144);
-  box.textContent = state.text || "Waiting for output…";
+  box.textContent = state.text || (state.cleared >= 0 ? "Output cleared." : "Waiting for output…");
   if (atEnd || truncated) box.scrollTop = box.scrollHeight;
 }
-function showPrompt(prompt) {
-  if (prompt && (!state.prompt || state.prompt.id !== prompt.id)) {
-    $("prompt-label").textContent = prompt.label;
-    $("answer").value = prompt.default;
+function stepError(text = "") {
+  $("step-error").textContent = text;
+  $("step-error").hidden = !text;
+}
+function openSetup() {
+  if (!$("setup-dialog").open) $("setup-dialog").showModal();
+}
+function beginWorkflow(run, target = run.target) {
+  state.workflow = run.id;
+  $("setup-title").textContent = (run.action === "add" ? "Add " : run.action === "edit" ? "Edit " : "Select build for ") + target;
+  $("add-form").hidden = true;
+  $("stop-setup").hidden = false;
+  $("step-status").hidden = false;
+  $("step-status").textContent = "Loading…";
+  stepError();
+  openSetup();
+}
+function showPrompt(prompt, run) {
+  if (!prompt) {
+    $("reply").hidden = $("resume").hidden = true;
+    if (state.workflow === run.id && run.code === null) {
+      $("step-status").hidden = false;
+      $("step-status").textContent = "Working…";
+    }
+  } else if (state.prompt?.id !== prompt.id) {
+    if (state.workflow !== run.id) beginWorkflow(run, prompt.app || run.target);
+    else if (run.action === "update" || run.action === "reinstall") $("setup-title").textContent = "Select build for " + (prompt.app || run.target);
+    if (state.dismissed !== run.id) openSetup();
+    stepError();
+    $("step-status").hidden = true;
     $("reply").hidden = false;
-    if (!$("service-dialog").open && !$("add-dialog").open) $("answer").focus({preventScroll:true});
-  } else if (!prompt) $("reply").hidden = true;
+    $("resume").hidden = $("setup-dialog").open;
+    $("prompt-label").textContent = prompt.label;
+    $("prompt-hint").textContent = prompt.hint;
+    const choices = prompt.options.length > 0;
+    const field = choices ? $("choice") : $("answer");
+    $("prompt-label").htmlFor = field.id;
+    $("answer").hidden = $("answer").disabled = choices;
+    $("choice").hidden = $("choice").disabled = !choices;
+    if (choices) {
+      const options = prompt.options.map(o => typeof o === "string" ? new Option(o, o) : new Option(o.label, o.value));
+      if (!options.some(o => o.value === prompt.default)) {
+        const placeholder = new Option("Choose an option…", "");
+        placeholder.disabled = true;
+        options.unshift(placeholder);
+      }
+      field.replaceChildren(...options);
+    }
+    field.required = prompt.required;
+    field.value = prompt.default;
+    $("next-step").disabled = false;
+    if ($("setup-dialog").open) field.focus({preventScroll:true});
+  }
   state.prompt = prompt;
 }
-async function selectRun(id, scroll = false) {
+function finishWorkflow(run) {
+  if (state.workflow !== run.id) return;
+  $("stop-setup").hidden = $("step-status").hidden = true;
+  if (run.code !== 0 && !run.cancelling) {
+    const errors = state.text.split("\n").filter(line => line.startsWith("! "));
+    stepError(errors.slice(-3).join("\n") || state.text.trim().split("\n").pop() || "Setup failed.");
+  } else $("setup-dialog").close();
+  state.workflow = null;
+}
+async function selectRun(id, scroll = false, reload = false) {
   if (scroll) document.querySelector(".output").scrollIntoView({block:"nearest"});
-  if (state.selected === id && state.stream) return;
+  if (state.selected === id && state.stream && !reload) return;
   clearRun();
   state.selected = id;
   state.cursor = -1;
@@ -213,17 +306,21 @@ async function selectRun(id, scroll = false) {
     try {
       const run = await api("runs/" + id + "?after=" + state.cursor, undefined, controller.signal);
       if (controller.signal.aborted) return;
+      if (state.cleared < run.cleared) { state.text = ""; state.replaceLine = false; }
+      state.cleared = run.cleared;
       state.cursor = run.cursor;
       const status = runState(run);
       $("run-caption").hidden = false;
-      $("run-caption").textContent = labels[run.action] + " · " + run.target;
+      $("run-caption").textContent = runLabel(run);
+      $("clear-output").disabled = false;
       $("run-badge").textContent = status[0];
       $("run-badge").className = "badge " + status[1];
       $("cancel").hidden = run.code !== null;
       $("cancel").disabled = run.cancelling;
       appendOutput(run.output, run.truncated);
-      showPrompt(run.prompt);
+      showPrompt(run.prompt, run);
       if (run.code !== null) {
+        finishWorkflow(run);
         const current = state.runs.find(item => item.id === id);
         if (current) Object.assign(current, {code:run.code, cancelling:run.cancelling});
         renderApps(); renderHistory();
@@ -242,10 +339,12 @@ async function loadDetail() {
   if (!app || !$("service-dialog").open) return;
   const mode = state.detailMode, seq = ++state.detailRequest;
   try {
-    const data = await api(mode + "?app=" + encodeURIComponent(app.name));
+    const since = state.journalSince.get(app.name);
+    const data = await api(mode + "?app=" + encodeURIComponent(app.name) +
+      (mode === "logs" && since ? "&since=" + since : ""));
     if (seq !== state.detailRequest || !$("service-dialog").open) return;
     const pre = $("detail-output"), pinned = pre.scrollHeight - pre.clientHeight - pre.scrollTop < 45;
-    pre.textContent = data.output || (data.code ? "Command failed (exit " + data.code + ")." : "No journal entries.");
+    pre.textContent = data.output || (data.code ? "Command failed (exit " + data.code + ")." : since && mode === "logs" ? "Waiting for new journal entries…" : "No journal entries.");
     if (mode === "logs" && pinned) pre.scrollTop = pre.scrollHeight;
   } catch (error) {
     if (seq === state.detailRequest) $("detail-output").textContent = error.message;
@@ -253,6 +352,8 @@ async function loadDetail() {
 }
 function detailMode(mode) {
   state.detailMode = mode;
+  $("clear-journal").hidden = mode !== "logs";
+  $("earlier-journal").hidden = mode !== "logs" || !state.journalSince.has(state.detail.name);
   for (const key of ["status", "logs"]) $("detail-" + key).classList.toggle("selected", key === mode);
   $("detail-output").textContent = "Loading…";
   loadDetail();
@@ -266,10 +367,17 @@ function openDetail(app, mode) {
 }
 $("nav-apps").addEventListener("click", () => toggleView("apps"));
 $("nav-history").addEventListener("click", () => toggleView("history"));
-$("add").addEventListener("click", () => { $("new-name").value = ""; $("add-dialog").showModal(); $("new-name").focus(); });
+$("nav-settings").addEventListener("click", () => toggleView("settings"));
+$("add").addEventListener("click", () => {
+  $("setup-title").textContent = "Add an application";
+  $("new-name").value = "";
+  $("add-form").hidden = false;
+  $("reply").hidden = $("stop-setup").hidden = $("step-status").hidden = true;
+  stepError(); openSetup(); $("new-name").focus();
+});
 $("add-form").addEventListener("submit", e => {
   e.preventDefault(); const name = $("new-name").value.trim();
-  if (name) { $("add-dialog").close(); startRun("add", name); }
+  if (name) startRun("add", name);
 });
 for (const action of ["check", "update"]) $(action + "-all").addEventListener("click", () => startRun(action, "all"));
 $("search").addEventListener("input", renderApps);
@@ -282,15 +390,61 @@ for (const node of document.querySelectorAll("[data-filter]")) node.addEventList
   renderApps();
 });
 document.querySelectorAll("dialog .close").forEach(node => node.addEventListener("click", () => node.closest("dialog").close()));
-$("cancel").addEventListener("click", async () => {
-  try { await api("runs/" + state.selected + "/cancel", {}); } catch (error) { notify(error.message); }
+async function cancelSelected() {
+  try { await api("runs/" + state.selected + "/cancel", {}); }
+  catch (error) { if ($("setup-dialog").open) stepError(error.message); else notify(error.message); }
+}
+$("cancel").addEventListener("click", cancelSelected);
+$("stop-setup").addEventListener("click", cancelSelected);
+$("setup-dialog").addEventListener("close", () => {
+  if (state.workflow) { state.dismissed = state.workflow; $("resume").hidden = !state.prompt; }
 });
+$("resume").addEventListener("click", () => { state.dismissed = null; $("resume").hidden = true; openSetup(); });
 $("reply").addEventListener("submit", async e => {
   e.preventDefault();
-  if (!state.prompt) return;
   const prompt = state.prompt;
-  try { await api("runs/" + state.selected + "/input", {id:prompt.id, value:$("answer").value}); }
+  if (!prompt || $("next-step").disabled) return;
+  $("next-step").disabled = true;
+  const value = $(prompt.options.length ? "choice" : "answer").value;
+  try { await api("runs/" + state.selected + "/input", {id:prompt.id, value}); }
+  catch (error) {
+    if (state.prompt?.id === prompt.id) { $("next-step").disabled = false; stepError(error.message); }
+  }
+});
+$("clear-output").addEventListener("click", async () => {
+  const id = state.selected;
+  try {
+    await api("runs/" + id + "/clear", {});
+    if (state.selected !== id) return;
+    const selected = state.runs.find(r => r.id === id);
+    if (selected && selected.code !== null) selectRun(id, false, true);
+  } catch (error) { notify(error.message); }
+});
+$("clear-history").addEventListener("click", async () => {
+  try { await api("history/clear", {}); await refreshState(); }
   catch (error) { notify(error.message); }
+});
+$("clear-journal").addEventListener("click", async () => {
+  const app = state.detail;
+  try {
+    const {since} = await api("logs/clear-view", {});
+    state.journalSince.set(app.name, since);
+    if (state.detail === app && state.detailMode === "logs") detailMode("logs");
+  } catch (error) { notify(error.message); }
+});
+$("earlier-journal").addEventListener("click", () => { state.journalSince.delete(state.detail.name); detailMode("logs"); });
+function showSettings(settings) {
+  state.settings = settings;
+  $("schedule-status").textContent = !settings.interval_hours ? "Automatic checks are off." :
+    settings.next_check * 1000 <= Date.now() ? "A check is due when Binup is idle." :
+      "Next check: " + new Date(settings.next_check * 1000).toLocaleString();
+}
+$("schedule-form").addEventListener("submit", async e => {
+  e.preventDefault();
+  $("save-schedule").disabled = true;
+  try { showSettings(await api("settings", {interval_hours:Number($("interval").value)})); }
+  catch (error) { notify(error.message); }
+  finally { $("save-schedule").disabled = false; }
 });
 for (const mode of ["status", "logs"]) $("detail-" + mode).addEventListener("click", () => detailMode(mode));
 $("reload-detail").addEventListener("click", loadDetail);

@@ -15,6 +15,7 @@
       <nav id="nav" aria-label="Binup">
         <button id="nav-apps" class="navlink active" aria-current="page">Applications</button>
         <button id="nav-history" class="navlink">Run history</button>
+        <button id="nav-settings" class="navlink">Settings</button>
       </nav>
     </div>
   </header>
@@ -35,21 +36,36 @@
         <p class="empty" id="apps-empty" hidden></p>
       </div>
     </section>
-    <section id="history-view" aria-label="Run history" hidden><div class="registry" id="history"></div></section>
+    <section id="history-view" aria-label="Run history" hidden>
+      <div class="history-tools"><button id="clear-history">Clear completed runs</button></div><div class="registry" id="history"></div>
+    </section>
+    <section id="settings-view" aria-label="Settings" hidden>
+      <form id="schedule-form"><label for="interval">Automatic update checks</label>
+        <p id="interval-hint">Check all registered apps in the background. Install updates with the Update button.</p>
+        <div class="settings-controls"><select id="interval" aria-describedby="interval-hint"><option value="0">Off</option><option value="1">Every hour</option><option value="6">Every 6 hours</option><option value="12">Every 12 hours</option><option value="24">Every day</option></select>
+          <button class="primary" id="save-schedule">Save</button></div>
+        <p id="schedule-status" role="status"></p>
+      </form>
+    </section>
     <section class="output" aria-label="Live command output">
       <div class="output-head"><div class="output-heading"><h2>Live output</h2><span id="run-badge" class="badge muted">Idle</span></div>
-        <button id="cancel" class="dark-button" hidden>Cancel run</button></div>
+        <div class="tools"><button id="resume" hidden>Resume setup</button><button id="clear-output" disabled>Clear output</button><button id="cancel" hidden>Cancel run</button></div></div>
       <div class="run-caption" id="run-caption" hidden></div>
       <pre id="transcript" tabindex="0" aria-label="Command output">Output appears here when you run a command.</pre>
-      <form id="reply" class="reply" hidden><label for="answer" id="prompt-label">Reply</label><div><input id="answer" autocomplete="off" spellcheck="false" maxlength="4096"><button class="primary">Send reply</button></div></form>
     </section>
   </main>
-  <dialog id="add-dialog"><form id="add-form"><div class="dialog-head"><h2>Add an application</h2><button class="close" type="button" aria-label="Close">×</button></div>
-    <label for="new-name">App name</label><input id="new-name" placeholder="e.g. syncthing" required maxlength="255" autocomplete="off">
-    <p>The setup prompts will open in Live output.</p><button class="primary">Continue</button></form></dialog>
+  <dialog id="setup-dialog" aria-labelledby="setup-title"><div class="dialog-head"><h2 id="setup-title">Add an application</h2><button class="close" type="button" aria-label="Close">×</button></div>
+    <form id="add-form"><label for="new-name">App name</label><input id="new-name" placeholder="e.g. syncthing" required maxlength="255" autocomplete="off"><div class="form-actions"><button class="primary">Continue</button></div></form>
+    <p id="step-status" role="status" hidden></p>
+    <form id="reply" hidden><label id="prompt-label" for="answer">Setup</label><p id="prompt-hint"></p>
+      <input id="answer" aria-describedby="prompt-hint" autocomplete="off" spellcheck="false" maxlength="4096"><select id="choice" aria-describedby="prompt-hint" hidden></select>
+      <div class="form-actions"><button id="next-step" class="primary">Continue</button></div></form>
+    <div id="step-error" role="alert" hidden></div>
+    <button type="button" id="stop-setup" hidden>Cancel run</button>
+  </dialog>
   <dialog id="service-dialog" class="service-dialog"><div class="dialog-head"><div><h2 id="detail-name">Service</h2><code id="detail-unit"></code></div><button class="close" type="button" aria-label="Close">×</button></div>
     <div class="detail-tools"><div class="filters"><button id="detail-status">Status</button><button id="detail-logs">Logs</button></div>
-      <label class="follow"><input id="follow" type="checkbox" checked> Live</label><button id="reload-detail" class="small">Refresh</button></div>
+      <label class="follow"><input id="follow" type="checkbox" checked> Live</label><button id="clear-journal" class="small" title="Show only new journal entries">Clear view</button><button id="earlier-journal" class="small" hidden>Show earlier</button><button id="reload-detail" class="small">Refresh</button></div>
     <pre id="detail-output" tabindex="0"></pre>
     <div class="detail-actions"><button id="start-unit">Start</button><button id="restart-unit">Restart</button><button id="stop-unit">Stop</button></div>
   </dialog>

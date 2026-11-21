@@ -38,7 +38,10 @@ def mock_command(tool, args):
             print((root / "release.json").read_text())
         return 0
     if tool == "journalctl":
-        print((root / "journal").read_text(), flush=True)
+        since = next((float(a.split("@", 1)[1]) for a in args if a.startswith("--since=@")), None)
+        journal = root / "journal"
+        if since is None or journal.stat().st_mtime >= since:
+            print(journal.read_text(), flush=True)
         if "--follow" in args:
             signal.pause()
         return 0
@@ -317,14 +320,16 @@ class ServiceTests(unittest.TestCase):
         process = subprocess.Popen([*script, "serve", "--config", str(self.config), *options],
                                    env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         self.addCleanup(self.stop_server, process)
+        self.web_process = process
         line = process.stdout.readline()
         self.assertIn("listening on", line)
         self.base = "http://127.0.0.1:" + line.strip().rsplit(":", 1)[1]
 
     @staticmethod
     def stop_server(process):
-        process.terminate()
-        process.communicate(timeout=15)
+        if process.poll() is None:
+            process.terminate()
+            process.communicate(timeout=15)
 
     def api(self, path, body=None, **headers):
         data = None if body is None else json.dumps(body).encode()
@@ -356,6 +361,71 @@ class ServiceTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             LocalAccess(["0.0.0.0/0"])
 
+    def finish_run(self, run):
+        path = "runs/" + run["id"]
+        detail = self.api(path)
+        while detail["code"] is None:
+            self.assertIsNone(detail["prompt"], detail)
+            detail = self.api(path + "?after=" + str(detail["cursor"]))
+        return self.api(path)
+
+    def test_scheduled_checks_and_version_results(self):
+        self.binary.write_bytes(PAYLOAD)
+        self.binary.chmod(0o755)
+        entry = dict(repo="org/app", bin=str(self.binary), version="v1", asset_regex="linux")
+        entries = {"current": entry, "old": dict(entry, version="v0", bin=str(self.root / "missing")),
+                   "broken": dict(entry, asset_regex="no-match"),
+                   "renamed": dict(entry, version="v0", asset_regex="old-filename")}
+        self.config.write_text(json.dumps(entries))
+        original = self.config.read_bytes()
+        self.start_server("--port", "0")
+        before = self.api("state")
+        self.assertEqual(before["settings"]["interval_hours"], 0)
+        self.assertTrue(all("check" not in app for app in before["apps"]))
+        with self.assertRaises(HTTPError):
+            self.api("settings", {"interval_hours": True})
+        # The first automatic run waits behind an open wizard.
+        pending = self.api("runs", {"action": "add", "app": "test"})
+        self.api("settings", {"interval_hours": 6})
+        self.assertEqual(len(self.api("state")["runs"]), 1)
+        self.api("runs/" + pending["id"] + "/cancel", {})
+        deadline = time.monotonic() + 12
+        while True:
+            runs = self.api("state")["runs"]
+            if runs[0]["scheduled"]:
+                break
+            self.assertLess(time.monotonic(), deadline)
+        check = self.finish_run(runs[0])
+        self.assertEqual(check["code"], 1)
+        state = self.api("state")
+        self.assertEqual({a["name"]: a["check"]["status"] for a in state["apps"]},
+                         {"current": "current", "old": "available", "broken": "error", "renamed": "available"})
+        renamed = next(a for a in state["apps"] if a["name"] == "renamed")["check"]
+        self.assertEqual((renamed["latest"], renamed["problem"]), ("v1", "Check failed"))
+        self.assertTrue(time.time() + 5*3600 < state["settings"]["next_check"] <= time.time() + 6*3600)
+        self.assertEqual(self.config.read_bytes(), original)
+        self.assertFalse((self.root / "missing").exists())
+        self.assertNotIn('"-o"', (self.root / "calls").read_text())
+        # Restart with an overdue check and leave the service running without a browser.
+        self.stop_server(self.web_process)
+        sidecar = self.config.with_name(self.config.name + ".web.json")
+        saved = json.loads(sidecar.read_text())
+        saved["next_check"] = time.time() - 1
+        sidecar.write_text(json.dumps(saved))
+        self.start_server("--port", "0")
+        time.sleep(0.8)
+        state = self.api("state")
+        self.assertEqual(len(state["runs"]), 1)
+        self.assertTrue(state["runs"][0]["scheduled"])
+        self.finish_run(state["runs"][0])
+        self.assertEqual(self.api("settings", {"interval_hours": 0})["next_check"], None)
+        entries["current"]["tag_regex"] = "changed"
+        self.config.write_text(json.dumps(entries))
+        self.assertNotIn("check", next(a for a in self.api("state")["apps"] if a["name"] == "current"))
+        self.api("history/clear", {})
+        self.assertFalse(self.api("state")["runs"])
+        self.assertIn("check", next(a for a in self.api("state")["apps"] if a["name"] == "old"))
+
     def test_web_runs_repair_cancel_and_access(self):
         # A unit from before the token-free upgrade may still pass the old option.
         self.start_server("--bind", "127.0.0.1", "--port", "0", "--token-file", str(self.root / "unused"))
@@ -380,11 +450,23 @@ class ServiceTests(unittest.TestCase):
                 break
         self.assertIn("0 matches", output)
         prompt = update["prompt"]
-        self.assertEqual(self.api(path)["prompt"]["id"], prompt["id"])
+        self.assertEqual([(o["value"], o["label"]) for o in prompt["options"]][0], ("1", "renamed.worker"))
+        with self.assertRaises(HTTPError):
+            self.api(path + "/input", {"id": prompt["id"], "value": "99"})
+        self.api(path + "/clear", {})
+        self.api("history/clear", {})
+        cleared = self.api(path)
+        self.assertEqual(cleared["output"], "")
+        self.assertGreater(cleared["cleared"], -1)
+        self.assertEqual(cleared["prompt"]["id"], prompt["id"])
         with self.assertRaises(HTTPError) as busy:
             self.api("runs", {"action": "edit", "app": "demo"})
         self.assertEqual(busy.exception.code, 409)
         self.assertIn("bind error", self.api("logs?app=demo")["output"])
+        cutoff = self.api("logs/clear-view", {})["since"]
+        self.assertEqual(self.api("logs?app=demo&since=" + str(cutoff))["output"], "")
+        (self.root / "journal").write_text("new service entry")
+        self.assertIn("new service entry", self.api("logs?app=demo&since=" + str(cutoff))["output"])
         self.api(path + "/input", {"id": prompt["id"], "value": "1"})
         with self.assertRaises(HTTPError) as stale:
             self.api(path + "/input", {"id": prompt["id"], "value": "1"})

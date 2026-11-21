@@ -57,19 +57,12 @@ body {
   justify-self: start;
   align-self: center;
   flex-wrap: wrap;
-  gap: .25rem;
+  gap: 1.25rem;
   max-width: 100%;
-  padding: .5rem 1rem;
-  background: var(--canvas);
-  border-radius: .375rem;
+  border-bottom: 1px solid var(--edge);
 }
-.navlink {
-  border: 0;
-  padding: .25rem 1rem;
-  border-radius: .375rem;
-  color: var(--text);
-}
-.navlink.active, .navlink:hover { background: var(--surface); color: var(--text); }
+.navlink { padding: .5rem .12rem; }
+.navlink:hover { color: var(--text); background: transparent; }
 #connection { grid-area: 1 / 2; }
 #apps-view, #history-view { margin-top: 2rem; }
 .registry { background: transparent; box-shadow: none; border: 0; }
@@ -106,6 +99,6 @@ td small { margin-top: .25rem; }
   :root { --content-inset: .75rem; }
   .page-head .wrap { grid-template-columns: 1fr; }
   #connection { grid-area: auto; }
-  #nav { padding-inline: .5rem; }
+  #nav { gap: .85rem; }
   #apps-view, #history-view { margin-top: .75rem; }
 }

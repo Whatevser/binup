@@ -46,7 +46,7 @@ h1, h2 { font-family: "Red Hat Display", "Red Hat Text", "Inter", system-ui, san
 h1 { font-size: 1.75rem; font-weight: 500; }
 h2 { font-size: 1.22rem; font-weight: 600; }
 code, pre, .version { font-family: var(--mono); }
-button, input, summary { font: inherit; }
+button, input, select, summary { font: inherit; }
 
 button, .row-actions summary {
   cursor: pointer;
@@ -62,7 +62,7 @@ button:hover, .row-actions summary:hover {
   background: var(--subtle);
 }
 button:disabled { opacity: .45; cursor: default; }
-button:focus-visible, input:focus-visible, pre:focus-visible, summary:focus-visible {
+button:focus-visible, input:focus-visible, select:focus-visible, pre:focus-visible, summary:focus-visible {
   outline: 2px solid var(--blue);
   outline-offset: 2px;
 }
@@ -72,7 +72,7 @@ button:focus-visible, input:focus-visible, pre:focus-visible, summary:focus-visi
   border-color: #0066cc;
 }
 .primary:hover { color: #fff; background: #004b95; }
-input:not([type=checkbox]) {
+input:not([type=checkbox]), select {
   color: var(--text);
   background: var(--surface);
   border: 1px solid var(--outline);
@@ -180,10 +180,22 @@ pre {
   max-height: 45vh;
   border-radius: 0 0 5px 5px;
 }
-.reply { padding: .8rem 1rem 1rem; }
-.reply label, dialog form > label { display: block; font-weight: 600; margin-bottom: .35rem; }
-.reply div { display: flex; gap: .6rem; }
-.reply input { flex: 1; }
+#setup-dialog label, #schedule-form label { display: block; font-weight: 600; margin-bottom: .35rem; }
+#setup-dialog input, #setup-dialog select { width: 100%; }
+#step-status, #prompt-hint, #schedule-form p { margin: .5rem 0; color: var(--secondary); }
+#prompt-hint:empty { display: none; }
+.form-actions, .settings-controls, .history-tools { display: flex; gap: .65rem; align-items: center; }
+.form-actions { margin-top: 1rem; }
+#stop-setup { margin-top: .8rem; }
+#step-error { color: var(--bad); margin-top: .75rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+#settings-view { margin-block: 1.5rem; }
+.settings-controls { margin-block: .75rem; }
+.history-tools { justify-content: flex-end; margin-bottom: .75rem; }
+.version.bad { color: #b12025; }
+:root[data-theme=dark] .version.bad { color: #ff999e; }
+.version small { font-family: "Red Hat Text", system-ui, sans-serif; }
+.version.good small, .version.bad small, .version.waiting small { color: inherit; }
+.output-head, .output-head .tools { flex-wrap: wrap; }
 .notice {
   margin-top: 1rem;
   padding: .65rem 1rem;
@@ -233,5 +245,4 @@ dialog form > p { margin: .8rem 0; color: var(--secondary); }
   td:last-child { grid-column: 1 / -1; }
   .row-actions { justify-content: flex-start; }
   .dropdown { right: auto; left: 0; }
-  .reply div { flex-wrap: wrap; }
 }

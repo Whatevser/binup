@@ -4,6 +4,7 @@ import argparse
 import codecs
 from collections import deque
 import fcntl
+import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import ipaddress
 import json
@@ -15,6 +16,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from urllib.parse import parse_qs, urlsplit
@@ -90,9 +92,12 @@ class IPv6Server(LocalServer):
 
 class Run:
     """One CLI process group. Prompts have a dedicated pipe and a single-use ID."""
-    def __init__(self, action, target, argv, env):
+    def __init__(self, action, target, argv, env, on_result, scheduled=False):
         self.id = secrets.token_hex(8)
         self.action, self.target = action, target
+        self.scheduled = scheduled
+        self.on_result = on_result
+        self.cleared = -1
         self.started = time.time()
         self.code = None
         self.cancelling = False
@@ -153,10 +158,15 @@ class Run:
                             while b"\n" in pending:
                                 line, pending = pending.split(b"\n", 1)
                                 item = json.loads(line)
-                                with self.changed:
-                                    self.append("\n? " + item["label"] + "\n")
-                                    self.notify()
-                                    self.prompt = dict(id=self.seq, label=item["label"], default=item["default"])
+                                if item.get("type") == "result":
+                                    try:
+                                        self.on_result(self.action, item)
+                                    except OSError as exc:
+                                        self.append(f"\n! Could not save check result: {exc}\n")
+                                else:
+                                    with self.changed:
+                                        self.notify()
+                                        self.prompt = dict(item, id=self.seq)
         except (OSError, ValueError, KeyError) as exc:
             self.append(f"\n! Console stream failed: {exc}\n")
             self.cancel()
@@ -172,7 +182,7 @@ class Run:
     def summary(self):
         with self.changed:
             return dict(id=self.id, action=self.action, target=self.target, started=self.started,
-                        code=self.code, cancelling=self.cancelling)
+                        code=self.code, cancelling=self.cancelling, scheduled=self.scheduled, cleared=self.cleared)
 
     def poll(self, cursor):
         with self.changed:
@@ -181,12 +191,25 @@ class Run:
             return dict(self.summary(), cursor=self.seq, truncated=cursor < self.discarded,
                         output="".join(text for number, text in self.events if number > cursor), prompt=self.prompt)
 
+    def clear_output(self):
+        with self.changed:
+            self.events.clear()
+            self.chars = 0
+            self.discarded = -1
+            self.notify()
+            self.cleared = self.seq
+
     def answer(self, prompt_id, value):
         if not isinstance(value, str) or len(value.encode()) > 4096 or any(ord(c) < 32 or ord(c) == 127 for c in value):
             raise RequestError(400, "Enter one line, up to 4096 bytes.")
         with self.changed:
             if self.cancelling or self.code is not None or not self.prompt or self.prompt["id"] != prompt_id:
                 raise RequestError(409, "This prompt has already closed. Read the current output.")
+            options = self.prompt.get("options", [])
+            if options and value not in [o if isinstance(o, str) else o["value"] for o in options]:
+                raise RequestError(400, "Choose one of the listed options.")
+            if self.prompt.get("required") and not value.strip():
+                raise RequestError(400, "This field is required.")
             try:
                 self.process.stdin.write((value + "\n").encode())
                 self.process.stdin.flush()
@@ -218,6 +241,87 @@ class Control:
         self.lock = threading.Lock()
         self.runs = {}
         self.stopping = False
+        self.web_file = config.with_name(config.name + ".web.json")
+        try:
+            self.web = json.loads(self.web_file.read_text())
+        except FileNotFoundError:
+            self.web = {"interval_hours": 0, "next_check": None, "checks": {}}
+        self.retry_after = 0
+
+    def save_web(self):
+        draft = tempfile.NamedTemporaryFile(mode="w", dir=self.web_file.parent, delete=False)
+        try:
+            with draft:
+                json.dump(self.web, draft)
+            os.replace(draft.name, self.web_file)
+        finally:
+            Path(draft.name).unlink(missing_ok=True)
+
+    @staticmethod
+    def signature(entry):
+        keys = ("repo", "bin", "version", "release_channel", "tag_regex", "asset_regex", "archive_member",
+                "asset_sha256", "binary_sha256", "archive_selector", "start_after_install")
+        raw = json.dumps([entry.get(key) for key in keys], ensure_ascii=True)
+        return hashlib.sha256(raw.encode()).hexdigest()
+
+    def record_check(self, action, item):
+        code = item["code"]
+        status = {0: "current", 10: "available"}.get(code, "error")
+        if item["reason"] == "Service awaiting first start":
+            status = "current"
+        result = dict(status=status, latest=item["tag"], reason=item["reason"] if code else "", checked=time.time(),
+                      signature=self.signature(item["entry"]))
+        with self.lock:
+            if status == "error":
+                result["problem"] = "Update failed" if action in ("update", "reinstall") else "Check failed"
+                installed = item["entry"].get("version")
+                if installed and result["latest"] and result["latest"] != installed:
+                    result["status"] = "available"
+                previous = self.web["checks"].get(item["app"])
+                if (previous and previous["signature"] == result["signature"] and
+                        previous["status"] == "available" and previous["latest"] == result["latest"]):
+                    result.update(status="available", reason=previous["reason"])
+            self.web["checks"][item["app"]] = result
+            self.save_web()
+
+    def settings(self):
+        return {k: self.web[k] for k in ("interval_hours", "next_check")}
+
+    def set_interval(self, hours):
+        if type(hours) is not int or hours not in (0, 1, 6, 12, 24):
+            raise RequestError(400, "Choose an available check interval.")
+        with self.lock:
+            previous = self.settings()
+            if hours != previous["interval_hours"]:
+                self.retry_after = 0
+                self.web.update(interval_hours=hours, next_check=time.time() if hours else None)
+                try:
+                    self.save_web()
+                except OSError:
+                    self.web.update(previous)
+                    raise
+            return self.settings()
+
+    def check_schedule(self):
+        now = time.time()
+        with self.lock:
+            due = self.web["next_check"]
+            if self.stopping or not due or now < max(due, self.retry_after):
+                return
+            if any(run.summary()["code"] is None for run in self.runs.values()):
+                return
+            self.retry_after = now + 60
+            try:
+                self.start_locked("check", "all", ["check", "all"], scheduled=True)
+                self.web["next_check"] = now + self.web["interval_hours"] * 3600
+                self.save_web()
+            except OSError as exc:
+                print(f"Scheduled check: {exc}", file=sys.stderr, flush=True)
+
+    def clear_history(self):
+        with self.lock:
+            self.runs = {key: run for key, run in self.runs.items() if run.summary()["code"] is None}
+        return {"ok": True}
 
     def entries(self):
         try:
@@ -238,9 +342,16 @@ class Control:
         result = self.command("list", "--json")
         if result.returncode:
             raise RequestError(500, result.stderr.strip() or "Could not list applications.")
+        apps = json.loads(result.stdout)
+        entries = self.entries()
         with self.lock:
+            for app in apps:
+                check = self.web["checks"].get(app["name"])
+                if check and check["signature"] == self.signature(entries.get(app["name"], {})):
+                    app["check"] = {k: v for k, v in check.items() if k != "signature"}
+            settings = self.settings()
             runs = [run.summary() for run in reversed(list(self.runs.values()))]
-        return dict(apps=json.loads(result.stdout), runs=runs)
+        return dict(apps=apps, runs=runs, settings=settings)
 
     def app_name(self, value, *, new=False, all_apps=False):
         if all_apps and value == "all":
@@ -269,11 +380,16 @@ class Control:
         with self.lock:
             if self.stopping or any(run.summary()["code"] is None for run in self.runs.values()):
                 raise RequestError(409, "A command is already running. Open its live output.")
-            if len(self.runs) >= HISTORY_LIMIT:
-                del self.runs[next(iter(self.runs))]
-            run = Run(action, target, argv, self.env)
-            self.runs[run.id] = run
-            return run.summary()
+            if action == "add" and self.web["checks"].pop(target, None) is not None:
+                self.save_web()
+            return self.start_locked(action, target, argv)
+
+    def start_locked(self, action, target, argv, scheduled=False):
+        run = Run(action, target, argv, self.env, self.record_check, scheduled)
+        if len(self.runs) >= HISTORY_LIMIT:
+            del self.runs[next(iter(self.runs))]
+        self.runs[run.id] = run
+        return run.summary()
 
     def lookup(self, identifier):
         with self.lock:
@@ -340,8 +456,22 @@ class Handler(BaseHTTPRequestHandler):
             return control.state()
         if method == "GET" and path in ("/api/logs", "/api/status"):
             name = control.app_name(query.get("app", [""])[0])
-            result = control.command(path.rsplit("/", 1)[1], name)
+            argv = [path.rsplit("/", 1)[1], name]
+            if path == "/api/logs" and "since" in query:
+                since = int(query["since"][0])
+                if since < 0 or since >= 10**18:
+                    raise RequestError(400, "Invalid journal timestamp.")
+                argv.append(f"--since=@{since // 10**6}.{since % 10**6:06d}")
+            result = control.command(*argv)
             return dict(output=result.stdout + result.stderr, code=result.returncode)
+        if method == "POST" and path == "/api/settings":
+            return control.set_interval(self.body().get("interval_hours"))
+        if method == "POST" and path == "/api/history/clear":
+            self.body()
+            return control.clear_history()
+        if method == "POST" and path == "/api/logs/clear-view":
+            self.body()
+            return {"since": time.time_ns() // 1000}
         if method == "POST" and path == "/api/runs":
             return control.begin(self.body())
         parts = path.strip("/").split("/")
@@ -354,6 +484,9 @@ class Handler(BaseHTTPRequestHandler):
                 body = self.body()
                 if parts[3] == "input":
                     run.answer(body.get("id"), body.get("value"))
+                    return {"ok": True}
+                if parts[3] == "clear":
+                    run.clear_output()
                     return {"ok": True}
                 if parts[3] == "cancel":
                     run.cancel()
@@ -415,6 +548,7 @@ def main():
         print(f"Binup listening on {args.bind}:{server.server_port}", flush=True)
         try:
             while not stopped.is_set():
+                server.control.check_schedule()
                 server.handle_request()
         finally:
             server.control.shutdown()
