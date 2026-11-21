@@ -119,6 +119,7 @@ nav { gap: 1.35rem; }
   box-shadow: var(--shadow);
 }
 .toolbar { padding: .8rem 1rem; flex-wrap: wrap; }
+.filter-tools { display: flex; align-items: center; flex-wrap: wrap; gap: .55rem; min-width: 0; }
 .filters { gap: .18rem; flex-wrap: wrap; }
 .filters button, .row-actions button, .row-actions summary { font-size: .875rem; padding: .24rem .58rem; }
 .filters button { color: var(--secondary); border-color: transparent; }

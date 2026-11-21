@@ -275,7 +275,10 @@ for (const action of ["check", "update"]) $(action + "-all").addEventListener("c
 $("search").addEventListener("input", renderApps);
 for (const node of document.querySelectorAll("[data-filter]")) node.addEventListener("click", () => {
   state.filter = node.dataset.filter;
-  for (const el of document.querySelectorAll("[data-filter]")) el.classList.toggle("selected", el === node);
+  for (const el of document.querySelectorAll("[data-filter]")) {
+    el.classList.toggle("selected", el === node);
+    el.setAttribute("aria-pressed", String(el === node));
+  }
   renderApps();
 });
 document.querySelectorAll("dialog .close").forEach(node => node.addEventListener("click", () => node.closest("dialog").close()));

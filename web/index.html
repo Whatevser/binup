@@ -22,9 +22,12 @@
     <div id="notice" class="notice" role="alert" hidden></div>
     <section id="apps-view" aria-label="Applications">
       <div class="registry">
-        <div class="toolbar"><div class="filters" aria-label="Filter app state"><button data-filter="all" class="selected">All</button><button data-filter="active">Running</button><button data-filter="issues">Needs attention</button></div>
-          <div class="tools">
+        <div class="toolbar">
+          <div class="filter-tools">
             <input type="search" id="search" placeholder="Find an app…" aria-label="Find an app">
+            <div class="filters" role="group" aria-label="Filter app state"><button data-filter="all" class="selected" aria-pressed="true">All</button><button data-filter="active" aria-pressed="false">Running</button><button data-filter="issues" aria-pressed="false">Needs attention</button></div>
+          </div>
+          <div class="tools">
             <button id="check-all">Check all</button><button id="update-all">Update all</button><button id="add" class="primary">Add app</button>
           </div>
         </div>

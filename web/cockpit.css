@@ -1,0 +1,111 @@
+/* Loaded by the Cockpit entry point. The frame owns its page surface and scroll area. */
+@font-face {
+  font-family: "Cockpit Red Hat Text";
+  src: local("Red Hat Text"), url("../../static/fonts/RedHatText/RedHatTextVF.woff2") format("woff2");
+  font-weight: 300 700;
+  font-display: swap;
+}
+
+:root {
+  --canvas: #f2f2f2;
+  --surface: #fff;
+  --subtle: #f2f2f2;
+  --page-gutter: 1.5rem;
+  --content-inset: 1.5rem;
+  --page-radius: 1rem;
+  height: 100%;
+  overflow: hidden;
+}
+:root[data-theme=dark] {
+  --canvas: #151515;
+  --surface: #292929;
+  --subtle: #383838;
+  --edge: #595959;
+  --outline: #8a8a8a;
+  --blue: #92c5f9;
+  --secondary: #c7c7c7;
+}
+body {
+  height: calc(100% - var(--page-gutter));
+  margin-inline: var(--page-gutter);
+  overflow: auto;
+  background: var(--surface);
+  border-radius: var(--page-radius);
+  font: .875rem/1.5 "Cockpit Red Hat Text", "Red Hat Text", Helvetica, Arial, sans-serif;
+}
+.wrap { padding-inline: var(--content-inset); }
+.page-head { background: transparent; border: 0; }
+.page-head .wrap {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  gap: .75rem;
+  padding-block: 1.25rem 1rem;
+}
+.heading { display: contents; }
+/* The sidebar already names the page. Keep its heading for screen readers. */
+.heading h1 {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+#nav {
+  grid-area: 1 / 1;
+  justify-self: start;
+  align-self: center;
+  flex-wrap: wrap;
+  gap: .25rem;
+  max-width: 100%;
+  padding: .5rem 1rem;
+  background: var(--canvas);
+  border-radius: .375rem;
+}
+.navlink {
+  border: 0;
+  padding: .25rem 1rem;
+  border-radius: .375rem;
+  color: var(--text);
+}
+.navlink.active, .navlink:hover { background: var(--surface); color: var(--text); }
+#connection { grid-area: 1 / 2; }
+#apps-view, #history-view { margin-top: 2rem; }
+.registry { background: transparent; box-shadow: none; border: 0; }
+.toolbar { padding: 0 0 1.5rem; gap: .75rem; }
+.toolbar input { width: 12.5rem; max-width: 100%; background: var(--subtle); }
+.toolbar input, .toolbar button { min-height: 2.3rem; border-radius: .375rem; }
+.filters { gap: 0; }
+.filters button { border: 1px solid var(--outline); border-radius: 0; padding-inline: .75rem; }
+.filters button:first-child { border-radius: .375rem 0 0 .375rem; }
+.filters button:last-child { border-radius: 0 .375rem .375rem 0; }
+.filters button + button { margin-inline-start: -1px; }
+.filters button.selected { position: relative; background: var(--blue); border-color: var(--blue); color: var(--surface); }
+:root[data-theme=dark] .primary { background: var(--blue); border-color: var(--blue); color: var(--canvas); }
+:root[data-theme=dark] .primary:hover { background: var(--blue-hover); }
+
+th { background: transparent; }
+th, td { font-size: inherit; padding: .8rem 1.5rem; }
+th:last-child, td:last-child { padding-inline-end: .75rem; }
+td small { margin-top: .25rem; }
+.history-row { border-top: 1px solid var(--edge); border-bottom: 0; }
+.output { box-shadow: none; border-radius: .5rem; margin: 1.5rem 0; }
+.output-head h2 { font-size: 1rem; }
+#transcript { border-end-start-radius: .45rem; border-end-end-radius: .45rem; }
+
+@media (max-width: 767px) {
+  :root { --page-gutter: 0rem; --page-radius: 0; }
+}
+@media (max-width: 720px) {
+  td, td:last-child { padding: 0; }
+  .toolbar input { width: 100%; }
+  .filter-tools { width: 100%; }
+}
+@media (max-width: 480px) {
+  :root { --content-inset: .75rem; }
+  .page-head .wrap { grid-template-columns: 1fr; }
+  #connection { grid-area: auto; }
+  #nav { padding-inline: .5rem; }
+  #apps-view, #history-view { margin-top: .75rem; }
+}

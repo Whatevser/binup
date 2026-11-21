@@ -2,6 +2,11 @@
 import "../base1/cockpit.js";
 import { start } from "./app.js";
 
+const stylesheet = document.createElement("link");
+stylesheet.rel = "stylesheet";
+stylesheet.href = new URL("./cockpit.css", import.meta.url).href;
+document.head.append(stylesheet);
+
 const http = window.cockpit.http(9098, {address: "127.0.0.1"});
 
 function request(path, body, signal) {

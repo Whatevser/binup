@@ -1038,7 +1038,7 @@ web_setup() (
     cockpit_package remove && ok 'Web service and Cockpit page removed.'; return
   fi
   if [[ ! -f $base/binup_web.py ]]; then install_latest; return; fi
-  for asset in index.html app.js entry.js standalone.js style.css manifest.json; do
+  for asset in index.html app.js entry.js standalone.js style.css cockpit.css manifest.json; do
     [[ -f $base/web/$asset ]] || { fail "Missing web/$asset. Run bash binup.sh install to get the complete release."; return 1; }
   done
   config_path=$(realpath -m -- "$config_path") || return 1
