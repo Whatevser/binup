@@ -1,0 +1,27 @@
+{
+  "qui": {
+    "bin": "/home/roman/bin/qui",
+    "service": "qui",
+    "scope": "user",
+    "version": "v1.36.0",
+    "repo": "autobrr/qui",
+    "asset_regex": ""
+  },
+  "qbit": {
+    "bin": "/home/roman/bin/qbittorrent-nox",
+    "service": "qbittorrent",
+    "scope": "user",
+    "version": "release-5.3.0_v2.1.2",
+    "repo": "userdocs/qbittorrent-nox-static",
+    "asset_regex": "^x86_64-qbittorrent-nox$",
+    "tag_regex": "^release-.*_v2\\.1\\.[0-9]+$"
+  },
+  "filebrowser": {
+    "bin": "/home/roman/bin/filebrowser",
+    "service": "filebrowser",
+    "scope": "user",
+    "version": "v2.0.2-stable",
+    "repo": "gtsteffaniak/filebrowser",
+    "asset_regex": ""
+  }
+}
