@@ -488,7 +488,7 @@ class Control:
             raise RequestError(404, "Application is no longer registered.")
         return value
 
-    def begin(self, body, local=False):
+    def begin(self, body):
         action = body.get("action")
         if action not in ("add", "edit", "check", "update", "reinstall", "remove", "start", "stop", "restart"):
             raise RequestError(400, "Unknown action.")
@@ -504,7 +504,7 @@ class Control:
                 raise RequestError(409, "A command is already running. Open its live output.")
             if action == "add" and self.web["checks"].pop(target, None) is not None:
                 self.save_web()
-            interactive = local and body.get("interactive_sudo") is True and action not in ("check", "remove")
+            interactive = body.get("interactive_sudo") is True and action not in ("check", "remove")
             owner = secrets.token_urlsafe(32) if interactive else None
             result = self.start_locked(action, target, argv, owner=owner)
             # Only the initiating response contains this per-run capability.
@@ -580,11 +580,8 @@ class Handler(BaseHTTPRequestHandler):
         if self.headers.get("Sec-Fetch-Site") == "cross-site":
             raise RequestError(403, "Open Binup directly or through Cockpit.")
         control = self.server.control
-        peer = ipaddress.ip_address(self.client_address[0])
-        if isinstance(peer, ipaddress.IPv6Address) and peer.ipv4_mapped:
-            peer = peer.ipv4_mapped
-        local = peer.is_loopback
-        owner = self.headers.get("X-Binup-Run", "") if local else ""
+        # LocalServer verifies the TCP peer before dispatch for every API route.
+        owner = self.headers.get("X-Binup-Run", "")
         if method == "GET" and path == "/api/state":
             return control.state()
         if method == "GET" and path in ("/api/logs", "/api/status"):
@@ -606,7 +603,7 @@ class Handler(BaseHTTPRequestHandler):
             self.body()
             return {"since": time.time_ns() // 1000}
         if method == "POST" and path == "/api/runs":
-            return control.begin(self.body(), local)
+            return control.begin(self.body())
         parts = path.strip("/").split("/")
         if len(parts) in (3, 4) and parts[:2] == ["api", "runs"]:
             run = control.lookup(parts[2])
@@ -616,8 +613,8 @@ class Handler(BaseHTTPRequestHandler):
             if method == "POST" and len(parts) == 4:
                 if parts[3] in ("input", "password") and not run.owns(owner):
                     raise RequestError(403, "Use the browser tab that started this run.")
-                if parts[3] == "password" and not (local and run.owner):
-                    raise RequestError(403, "Use Cockpit over HTTPS or a localhost connection.")
+                if parts[3] == "password" and not run.owner:
+                    raise RequestError(403, "This run was started without interactive sudo. Start a new run from the web UI.")
                 body = self.body()
                 if parts[3] in ("input", "password"):
                     run.answer(body.get("id"), body.get("value"), secret=parts[3] == "password")

@@ -192,7 +192,7 @@ class ServiceTests(unittest.TestCase):
         self.cli("logs", "demo")
         self.assertIn("--unit=" + UNIT, (self.root / "calls").read_text())
         (self.root / "deny-sudo").touch()
-        self.assertIn("Cockpit over HTTPS", self.cli("service", "demo", "stop", code=1, env=dict(self.env, BINUP_WEB="1")))
+        self.assertIn("start a new run from the web UI", self.cli("service", "demo", "stop", code=1, env=dict(self.env, BINUP_WEB="1")))
 
     def test_failed_setup_and_existing_unit(self):
         (self.root / "fail-enable").touch()
@@ -449,10 +449,35 @@ class ServiceTests(unittest.TestCase):
         self.binary.chmod(0o755)
         self.create("system")
         (self.root / "password-required").touch()
-        self.start_server("--bind", "127.0.0.1", "--port", "0")
+        # Exercise a private, non-loopback TCP peer even on loopback-only CI.
+        from threading import Thread
+        sys.path.insert(0, str(ROOT))
+        try:
+            from binup_web import Control, Handler, LocalAccess, LocalServer
+        finally:
+            sys.path.pop(0)
+
+        class LanServer(LocalServer):
+            def get_request(self):
+                sock, address = super().get_request()
+                return sock, ("192.168.10.42", address[1])
+
+        server = LanServer(("127.0.0.1", 0), Handler)
+        server.access = LocalAccess(aliases=["green-g4"])
+        server.files = {}
+        server.control = Control(self.config)
+        server.control.env.update(self.env)
+        worker = Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.control.shutdown)
+        self.addCleanup(worker.join)
+        self.addCleanup(server.shutdown)
+        self.base = "http://127.0.0.1:" + str(server.server_port)
 
         def begin():
-            run = self.api("runs", {"action": "restart", "app": "demo", "interactive_sudo": True})
+            run = self.api("runs", {"action": "restart", "app": "demo", "interactive_sudo": True},
+                           Host="green-g4:9098", Origin="http://green-g4:9098")
             return "runs/" + run["id"], {"X-Binup-Run": run["owner"]}
 
         def wait_for(path, headers, predicate):

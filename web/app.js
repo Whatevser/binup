@@ -217,7 +217,7 @@ async function startRun(action, app) {
   notify();
   renderApps();
   try {
-    const run = await api("runs", {action, app, interactive_sudo:window.isSecureContext});
+    const run = await api("runs", {action, app, interactive_sudo:true});
     if (run.owner) { rememberRun(run.id, run.owner); delete run.owner; }
     state.runs.unshift(run);
     selectRun(run.id, action !== "add" && action !== "edit");

@@ -64,7 +64,7 @@ as_root() {
     fi
     local rc
     if sudo -n -- "$@"; then return 0; else rc=$?; fi
-    warn 'If sudo needs a password, open Binup in Cockpit over HTTPS or through localhost and retry.'
+    warn 'If sudo needs a password, refresh Binup and start a new run from the web UI.'
     return "$rc"
   else sudo -- "$@"; fi
 }
