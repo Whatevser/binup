@@ -3,7 +3,8 @@
 const $ = id => document.getElementById(id);
 const labels = {add: "Add", edit: "Edit", check: "Check", update: "Update", reinstall: "Reinstall",
                 remove: "Remove", start: "Start", stop: "Stop", restart: "Restart"};
-const state = {token: sessionStorage.getItem("binupToken") || "", apps: [], runs: [], view: "apps",
+let api;
+const state = {connected: false, apps: [], runs: [], view: "apps",
                filter: "all", selected: null, cursor: -1, stream: null, text: "", replaceLine: false,
                prompt: null, detail: null, detailMode: "logs", detailRequest: 0, refresh: 0, starting: false};
 
@@ -24,23 +25,7 @@ function notify(message = "") {
   $("notice").textContent = message;
   $("notice").hidden = !message;
 }
-async function api(path, body, signal) {
-  const headers = {Authorization: "Bearer " + state.token};
-  const options = {headers, cache: "no-store", signal};
-  if (body !== undefined) {
-    headers["Content-Type"] = "application/json";
-    options.method = "POST";
-    options.body = JSON.stringify(body);
-  }
-  const response = await fetch("/api/" + path, options);
-  const data = await response.json();
-  if (!response.ok) {
-    if (response.status === 401 && !$("console").hidden) signOut();
-    throw new Error(data.error || "Request failed (" + response.status + ")");
-  }
-  return data;
-}
-function busy() { return state.starting || state.runs.some(run => run.code === null); }
+function busy() { return !state.connected || state.starting || state.runs.some(run => run.code === null); }
 function runState(run) {
   if (run.code === null) return [run.cancelling ? "Cancelling" : "Running", "waiting"];
   if (run.code === 0) return ["Completed", "good"];
@@ -64,7 +49,12 @@ function toggleView(view) {
   state.view = view;
   $("apps-view").hidden = view !== "apps";
   $("history-view").hidden = view !== "history";
-  ["apps", "history"].forEach(v => $("nav-" + v).classList.toggle("active", view === v));
+  for (const v of ["apps", "history"]) {
+    const tab = $("nav-" + v);
+    tab.classList.toggle("active", view === v);
+    if (v === view) tab.setAttribute("aria-current", "page");
+    else tab.removeAttribute("aria-current");
+  }
 }
 function cell(row, text, css) {
   const td = element("td", text, css);
@@ -118,7 +108,8 @@ function renderApps() {
   }
   $("apps").replaceChildren(rows);
   $("apps-empty").hidden = visible.length !== 0;
-  $("apps-empty").textContent = state.apps.length ? "No apps match this filter." : "No applications registered.";
+  $("apps-empty").textContent = !state.connected ? "Waiting for Binup…" :
+    (state.apps.length ? "No apps match this filter." : "No applications registered.");
   for (const id of ["start-unit", "restart-unit", "stop-unit"]) $(id).disabled = locked;
 }
 function renderHistory() {
@@ -136,8 +127,10 @@ async function refreshState() {
   if (state.starting) return;
   const seq = ++state.refresh;
   const data = await api("state");
-  if (seq !== state.refresh || !state.token) return;
+  if (seq !== state.refresh) return;
   const previous = JSON.stringify(state.apps), wasBusy = busy();
+  if (!state.connected) notify();
+  state.connected = true;
   state.apps = data.apps;
   state.runs = data.runs;
   // Keep open row menus and keyboard focus during an ordinary status refresh.
@@ -149,25 +142,11 @@ async function refreshState() {
   $("connection").classList.remove("offline");
 }
 function reportConnection(error) {
-  if ($("console").hidden) return;
+  state.connected = false;
+  renderApps();
   $("connection").textContent = "Disconnected";
   $("connection").classList.add("offline");
   notify(error.message);
-}
-async function connect(token) {
-  state.token = token;
-  $("login-error").textContent = "";
-  try {
-    await refreshState();
-    sessionStorage.setItem("binupToken", token);
-    $("token").value = "";
-    $("login").hidden = true;
-    for (const id of ["console", "nav", "session"]) $(id).hidden = false;
-    renderApps();
-  } catch (error) {
-    signOut();
-    $("login-error").textContent = error.message;
-  }
 }
 function clearRun() {
   if (state.stream) state.stream.abort();
@@ -179,17 +158,6 @@ function clearRun() {
   $("transcript").textContent = "Output appears here when you run a command.";
   $("run-badge").textContent = "Idle";
   $("run-badge").className = "badge muted";
-}
-function signOut() {
-  sessionStorage.removeItem("binupToken");
-  state.token = "";
-  state.refresh++;
-  clearRun();
-  state.apps = []; state.runs = [];
-  $("service-dialog").close(); $("add-dialog").close();
-  $("login").hidden = false;
-  for (const id of ["console", "nav", "session"]) $(id).hidden = true;
-  notify();
 }
 async function startRun(action, app) {
   if (busy()) return;
@@ -296,8 +264,6 @@ function openDetail(app, mode) {
   $("service-dialog").showModal();
   detailMode(mode);
 }
-$("login-form").addEventListener("submit", e => { e.preventDefault(); connect($("token").value.trim()); });
-$("signout").addEventListener("click", signOut);
 $("nav-apps").addEventListener("click", () => toggleView("apps"));
 $("nav-history").addEventListener("click", () => toggleView("history"));
 $("add").addEventListener("click", () => { $("new-name").value = ""; $("add-dialog").showModal(); $("new-name").focus(); });
@@ -341,6 +307,17 @@ async function watchService() {
   try { if ($("service-dialog").open && $("follow").checked && !document.hidden) await loadDetail(); }
   finally { setTimeout(watchService, 2500); }
 }
-setTimeout(watchApps, 8000);
-setTimeout(watchService, 2500);
-if (state.token) connect(state.token);
+export function start(request, preferredTheme = () => "auto") {
+  api = request;
+  const media = window.matchMedia("(prefers-color-scheme: dark)");
+  function applyTheme() {
+    const theme = preferredTheme();
+    document.documentElement.dataset.theme = theme === "auto" ? (media.matches ? "dark" : "light") : theme;
+  }
+  media.addEventListener("change", applyTheme);
+  window.addEventListener("storage", applyTheme);
+  applyTheme();
+  renderApps();
+  watchApps();
+  watchService();
+}

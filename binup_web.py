@@ -4,18 +4,17 @@ import argparse
 import codecs
 from collections import deque
 import fcntl
-import hmac
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import ipaddress
 import json
 import os
 from pathlib import Path
 import secrets
 import selectors
 import signal
-import stat
+import socket
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 from urllib.parse import parse_qs, urlsplit
@@ -23,7 +22,8 @@ from urllib.parse import parse_qs, urlsplit
 
 ROOT = Path(__file__).resolve().parent
 SCRIPT = str(ROOT / "binup.sh")
-STATIC = {"/": ("index.html", "text/html"), "/app.js": ("app.js", "text/javascript"),
+STATIC = {"/": ("index.html", "text/html"), "/entry.js": ("standalone.js", "text/javascript"),
+          "/app.js": ("app.js", "text/javascript"),
           "/style.css": ("style.css", "text/css")}
 OUTPUT_LIMIT = 256 * 1024
 HISTORY_LIMIT = 12
@@ -35,25 +35,57 @@ class RequestError(Exception):
         self.status = status
 
 
-def access_token(path, create=False):
-    if create:
-        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        with tempfile.NamedTemporaryFile(dir=path.parent) as draft:
-            draft.write((secrets.token_urlsafe(32) + "\n").encode())
-            draft.flush()
-            try:
-                os.link(draft.name, path)
-            except FileExistsError:
-                pass
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    with os.fdopen(fd) as stream:
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o077:
-            raise ValueError(f"Use a private, user-owned token file: {path} (chmod 600).")
-        token = stream.read(256).strip()
-        if not 32 <= len(token) < 256 or not token.isascii():
-            raise ValueError(f"Invalid token file: {path}")
-        return token
+class LocalAccess:
+    """Trust the TCP peer. Only accept literal local addresses and known Host names."""
+    def __init__(self, extra_networks=(), aliases=()):
+        local = ("127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+                 "100.64.0.0/10", "169.254.0.0/16", "::1/128", "fc00::/7", "fe80::/10")
+        self.networks = [ipaddress.ip_network(prefix) for prefix in (*local, *extra_networks)]
+        if any(net.prefixlen == 0 for net in self.networks):
+            raise ValueError("Specify the actual tunnel subnet in BINUP_EXTRA_NETWORKS.")
+        hostname = socket.gethostname().split(".")[0]
+        self.names = {name.lower().rstrip(".") for name in
+                      ("localhost", hostname, hostname + ".local", socket.getfqdn(), *aliases)}
+
+    def permits_ip(self, host):
+        try:
+            address = ipaddress.ip_address(host)
+        except ValueError:
+            return False
+        if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+            address = address.ipv4_mapped
+        return any(address in network for network in self.networks)
+
+    def permits_host(self, authority):
+        if not authority or any(c.isspace() or c in "/\\@?#," for c in authority):
+            return False
+        try:
+            url = urlsplit("//" + authority)
+            host = url.hostname
+            if not host:
+                return False
+            expected = f"[{host}]" if ":" in host else host
+            if url.port is not None:
+                expected += f":{url.port}"
+            if authority.lower() != expected.lower():
+                return False
+        except ValueError:
+            return False
+        return self.permits_ip(host) or host.lower().rstrip(".") in self.names
+
+
+class LocalServer(ThreadingHTTPServer):
+    def verify_request(self, request, client_address):
+        return self.access.permits_ip(client_address[0])
+
+
+class IPv6Server(LocalServer):
+    address_family = socket.AF_INET6
+
+    def server_bind(self):
+        if self.server_address[0] == "::" and socket.has_dualstack_ipv6():
+            self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        super().server_bind()
 
 
 class Run:
@@ -295,12 +327,14 @@ class Handler(BaseHTTPRequestHandler):
         return data
 
     def api(self, method, path, query):
-        expected = ("Bearer " + self.server.token).encode()
-        if not hmac.compare_digest(self.headers.get("Authorization", "").encode(), expected):
-            raise RequestError(401, "Enter the server access token.")
+        authority = self.headers["Host"].lower()
         origin = self.headers.get("Origin")
-        if origin and urlsplit(origin).netloc.lower() != self.headers.get("Host", "").lower():
-            raise RequestError(403, "Request origin does not match this server.")
+        if origin:
+            source = urlsplit(origin)
+            if source.scheme not in ("http", "https") or source.netloc.lower() != authority:
+                raise RequestError(403, "Request origin does not match this server.")
+        if self.headers.get("Sec-Fetch-Site") == "cross-site":
+            raise RequestError(403, "Open Binup directly or through Cockpit.")
         control = self.server.control
         if method == "GET" and path == "/api/state":
             return control.state()
@@ -328,6 +362,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def dispatch(self, method):
         try:
+            hosts = self.headers.get_all("Host", [])
+            if len(hosts) != 1 or not self.server.access.permits_host(hosts[0]):
+                self.send_bytes(403, b'{"error":"Use the server IP or a configured local hostname."}', "application/json")
+                return
             url = urlsplit(self.path)
             if method == "GET" and url.path in self.server.files:
                 mime, data = self.server.files[url.path]
@@ -357,22 +395,23 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("serve", "init-token"))
+    parser.add_argument("mode", choices=("serve",))
     parser.add_argument("--config", type=Path, default=ROOT / "binup.json")
-    parser.add_argument("--token-file", type=Path, required=True)
-    parser.add_argument("--bind", default="0.0.0.0")
+    # Units generated by older installers pass this argument until reinstalled.
+    parser.add_argument("--token-file", help=argparse.SUPPRESS)
+    parser.add_argument("--bind", default="::" if socket.has_dualstack_ipv6() else "0.0.0.0")
     parser.add_argument("--port", type=int, default=9098)
     args = parser.parse_args()
-    token = access_token(args.token_file, args.mode == "init-token")
-    if args.mode == "init-token":
-        return
+    access = LocalAccess(os.environ.get("BINUP_EXTRA_NETWORKS", "").split(),
+                         os.environ.get("BINUP_HOSTNAMES", "").split())
     files = {url: (mime, (ROOT / "web" / name).read_bytes()) for url, (name, mime) in STATIC.items()}
     stopped = threading.Event()
     for signum in (signal.SIGTERM, signal.SIGINT):
         signal.signal(signum, lambda *_: stopped.set())
-    with ThreadingHTTPServer((args.bind, args.port), Handler) as server:
+    server_class = IPv6Server if ":" in args.bind else LocalServer
+    with server_class((args.bind, args.port), Handler) as server:
         server.control = Control(args.config.resolve())
-        server.files, server.token, server.timeout = files, token, 0.4
+        server.files, server.access, server.timeout = files, access, 0.4
         print(f"Binup listening on {args.bind}:{server.server_port}", flush=True)
         try:
             while not stopped.is_set():

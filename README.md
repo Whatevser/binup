@@ -2,33 +2,41 @@
 
 Update standalone Linux programs from GitHub releases, including single binaries and archives. Run `bash binup.sh` for the interactive menu. Binup uses `binup.json` beside the script, or the path in `BINUP_CONF`. The included JSON contains example entries with machine-specific paths.
 
-## Install the web UI
+## Upgrade from the basic script
 
-On Ubuntu or Linux Mint, install the runtime dependencies if needed.
-
-```bash
-sudo apt install git curl jq util-linux python3
-```
-
-If you already have a binup **Git checkout** with your working JSON, run these commands inside it as your normal user.
+Run this **as your normal user from the folder containing your current `binup.sh` and `binup.json`**.
 
 ```bash
-git pull --ff-only
-bash binup.sh web-install
-bash binup.sh web-token
+curl -fsSLo binup-upgrade.sh https://raw.githubusercontent.com/Whatevser/binup/main/binup.sh && bash binup-upgrade.sh install "$PWD/binup.json"
 ```
 
-If your current folder contains **loose copies of the script and your working JSON**, run these commands from that folder. The new checkout will use your existing registry.
+The installer downloads the matching CLI, server and UI together. It enables `binup-web.service`, adds Binup to Cockpit when installed, and points the old `binup.sh` at the installed version. Your apps, matching rules and installed versions stay in the same JSON. For subsequent upgrades run `bash binup.sh install` from that folder. Loose-script installations use curl and tar and keep their runtime under `~/.local/share/binup-runtime`, or `$XDG_DATA_HOME/binup-runtime` if configured.
+
+If you already use a Git checkout, update it and install directly from there. A reinstall reuses the registry from the existing Binup user service. Pass a JSON path to choose a different registry.
 
 ```bash
-git clone https://github.com/Whatevser/binup.git "$HOME/.local/share/binup"
-bash "$HOME/.local/share/binup/binup.sh" web-install "$PWD/binup.json"
-bash "$HOME/.local/share/binup/binup.sh" web-token
+git pull --ff-only && bash binup.sh web-install
 ```
 
-Open `http://<server-IP>:9098` and enter the printed token. You can also install it, show the token, check its status or uninstall it from **9 · Web UI** in the terminal menu. The user service listens on `0.0.0.0:9098`. Anyone with the token can install and run software as the service account. Use HTTP on a trusted LAN or VPN, or put it behind an HTTPS reverse proxy.
+On Ubuntu and Mint, the required packages are `bash curl jq util-linux python3 tar coreutils`. The installers use your systemd user manager.
 
-The installer enables `binup-web.service` and runs it directly from the checkout. Keep the checkout at that path. To update the UI, pull there and run `systemctl --user restart binup-web.service`. To start it at boot and keep it after logout, run `loginctl enable-linger "$USER"`. To inspect the UI service itself, run `journalctl --user-unit=binup-web.service -n 100 --no-pager`. To remove it, run `bash binup.sh web-uninstall`. Your registry, app units and access token stay on disk.
+## Open Binup
+
+- **Cockpit** — Sign in to the managed host as the user who installed Binup. Refresh Cockpit and choose **System → Binup** in the left sidebar. The applications, service journals, live output and interactive prompts work within the page. Cockpit carries requests to port 9098 on the selected host. The browser only needs access to Cockpit. The package lives in your user Cockpit data directory. If you install Cockpit later, rerun `bash binup.sh web-install`.
+- **Standalone** — Open `http://<LAN-or-VPN-IP>:9098/`. The page opens immediately on an allowed connection. Binup accepts loopback, private LAN IPs, Tailscale’s `100.64.0.0/10`, link-local addresses and IPv6 unique-local addresses. This covers WireGuard and ZeroTier networks using those ranges. IPv6 is enabled when the host supports a dual-stack listener.
+- **Terminal** — Run `bash binup.sh` for the app menu. **9 · Web UI** installs the service and Cockpit page, shows the service status, or uninstalls both. Your registry and managed app units are kept.
+
+Anyone who can reach the standalone service from an allowed network can operate it as the installing user. It checks the actual TCP peer. Keep a public reverse proxy or port-forward that rewrites clients to a trusted source away from this port. Use Cockpit or your VPN for remote access.
+
+IP literals and the machine's own hostnames work by default. For a custom tunnel prefix or an extra DNS name such as a full MagicDNS name, run `systemctl --user edit binup-web.service`, set only the values you need, then run `systemctl --user restart binup-web.service`. Each setting takes a space-separated list.
+
+```ini
+[Service]
+Environment="BINUP_EXTRA_NETWORKS=2001:db8:1234::/64"
+Environment="BINUP_HOSTNAMES=server.example-tailnet.ts.net"
+```
+
+Replace the example prefix with your actual private tunnel's routed prefix. To start the service at boot and keep it after logout, use `loginctl enable-linger "$USER"`. Read its own logs with `journalctl --user-unit=binup-web.service -n 100 --no-pager`. Remove the service and sidebar entry with `bash binup.sh web-uninstall`.
 
 ## Manage apps and services
 

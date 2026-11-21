@@ -1,0 +1,12 @@
+{
+  "version": 0,
+  "menu": {
+    "index": {
+      "label": "Binup",
+      "path": "index.html",
+      "order": 75,
+      "keywords": [{"matches": ["binary", "updates", "services", "binup"]}]
+    }
+  },
+  "x-binup-package": true
+}

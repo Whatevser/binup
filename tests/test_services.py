@@ -6,12 +6,13 @@ from pathlib import Path
 import shlex
 import shutil
 import signal
-import stat
 import subprocess
+import tarfile
 import sys
 import tempfile
 import time
 import unittest
+from types import SimpleNamespace
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -26,7 +27,9 @@ def mock_command(tool, args):
     with (root / "calls").open("a") as stream:
         stream.write(json.dumps([tool, *args]) + "\n")
     if tool == "curl":
-        if "-o" in args:
+        if args[-1].startswith("https://codeload.github.com/"):
+            shutil.copyfile(root / "bundle.tar.gz", args[args.index("-o") + 1])
+        elif "-o" in args:
             Path(args[args.index("-o") + 1]).write_bytes(PAYLOAD)
         else:
             print((root / "release.json").read_text())
@@ -103,7 +106,7 @@ class ServiceTests(unittest.TestCase):
         self.config.write_text("{}\n")
         self.binary = self.root / "a worker $file %test"
         self.env = dict(os.environ, BINUP_CONF=str(self.config), BINUP_TEST=tmp.name,
-                        XDG_CONFIG_HOME=str(self.root / "config"), PATH=str(tools) + ":" + os.environ["PATH"])
+                        XDG_CONFIG_HOME=str(self.root / "config"), XDG_DATA_HOME=str(self.root / "data"), PATH=str(tools) + ":" + os.environ["PATH"])
         (self.root / "journal").write_text("unit failed: bind error\n")
         self.release("linux_x86_64")
 
@@ -224,37 +227,91 @@ class ServiceTests(unittest.TestCase):
         alternate.write_text("{}")
         self.config.write_text("{broken")
         self.cli("web-install", str(alternate))
-        token = self.cli("web-token").strip()
-        self.assertGreaterEqual(len(token), 32)
-        self.assertEqual(stat.S_IMODE((self.root / "config/binup/web.token").stat().st_mode), 0o600)
+        self.assertFalse((self.root / "config/binup/web.token").exists())
         unit = self.unit().with_name("binup-web.service")
         text = unit.read_text()
         self.assertIn(str(alternate).replace("%", "%%"), text)
         self.assertIn("KillMode=mixed", text)
+        self.assertNotIn("--token-file", text)
         if shutil.which("systemd-analyze"):
             subprocess.run(["systemd-analyze", "verify", str(unit)], check=True, capture_output=True)
         self.cli("web-install", str(alternate))
-        self.assertEqual(self.cli("web-token").strip(), token)
         alternate_env = dict(self.env, BINUP_CONF=str(alternate))
-        self.assertIn(token, self.cli(answers=["9", "2", "5", "8"], env=alternate_env))
+        self.assertIn("Web UI action", self.cli(answers=["9", "4", "8"], env=alternate_env))
+        previous_env = self.env.copy()
+        del previous_env["BINUP_CONF"]
+        legacy_unit = [line + ' "--token-file" "/old/token"' if line.startswith("ExecStart=") else line
+                       for line in text.splitlines()]
+        unit.write_text("\n".join(legacy_unit) + "\n")
+        self.cli("web-install", env=previous_env)
+        self.assertIn(str(alternate).replace("%", "%%"), unit.read_text())
+        self.assertNotIn("--token-file", unit.read_text())
         self.cli("web-uninstall")
         self.assertFalse(unit.exists())
-        self.assertEqual(self.cli("web-token").strip(), token)
         unit.write_text("[Service]\nExecStart=/bin/sleep infinity\n")
         self.assertIn("belongs to another service", self.cli("web-install", str(alternate), code=1))
         self.assertIn("/bin/sleep", unit.read_text())
 
+    @unittest.skipIf(os.geteuid() == 0, "web setup runs as an unprivileged account")
+    def test_cockpit_discovery_upgrade_and_uninstall(self):
+        package = self.root / "data/cockpit/binup"
+        bridge = self.root / "tools/cockpit-bridge"
+        bridge.write_text("#!/bin/sh\nexit 0\n")
+        bridge.chmod(0o755)
+        self.cli("web-install")
+        self.assertEqual(package.resolve(), ROOT / "web")
+        manifest = json.loads((package / "manifest.json").read_text())
+        self.assertEqual(manifest["menu"]["index"]["label"], "Binup")
+        self.assertTrue((package / manifest["menu"]["index"]["path"]).is_file())
+        self.cli("web-install")
+        self.cli("web-uninstall")
+        self.assertFalse(package.is_symlink())
+        package.mkdir()
+        (package / "keep").touch()
+        self.assertIn("unrelated Cockpit package", self.cli("web-install", code=1))
+        self.assertTrue((package / "keep").is_file())
+
+    @unittest.skipIf(os.geteuid() == 0, "web setup runs as an unprivileged account")
+    def test_one_file_upgrade_preserves_registry(self):
+        loose = self.root / "my tools"
+        loose.mkdir()
+        launcher, live = loose / "binup.sh", loose / "binup.json"
+        launcher.write_text("#!/bin/bash\n# previous version\n")
+        live.write_text('{"saved":{"service":"","repo":"org/app","custom":true}}\n')
+        before = live.read_bytes()
+        bootstrap = loose / "binup-upgrade.sh"
+        shutil.copyfile(ROOT / "binup.sh", bootstrap)
+        with tarfile.open(self.root / "bundle.tar.gz", "w:gz") as archive:
+            for file in ("binup.sh", "binup_web.py", "web", "binup.json"):
+                archive.add(ROOT / file, "binup-main/" + file)
+        env = self.env.copy()
+        del env["BINUP_CONF"]
+        for script in (bootstrap, launcher):
+            subprocess.run(["bash", str(script), "install"], env=env, check=True, capture_output=True)
+            self.assertTrue(launcher.is_symlink())
+            self.assertEqual(live.read_bytes(), before)
+            result = subprocess.run(["bash", str(launcher), "list", "--json"], env=env, capture_output=True,
+                                    check=True, text=True)
+            self.assertEqual(json.loads(result.stdout)[0]["name"], "saved")
+        unit = self.unit().with_name("binup-web.service").read_text()
+        self.assertIn(str(live), unit)
+        self.assertNotIn("--token-file", unit)
+        self.assertFalse((launcher.resolve().parent / "binup.json").exists())
+        installed = launcher.resolve()
+        (self.root / "bundle.tar.gz").write_bytes(b"incomplete download")
+        rejected = subprocess.run(["bash", str(launcher), "install"], env=env, capture_output=True)
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertEqual(launcher.resolve(), installed)
+        self.assertEqual(live.read_bytes(), before)
+
     def start_server(self, *options):
-        token = self.root / "token"
         script = [sys.executable, str(ROOT / "binup_web.py")]
-        subprocess.run([*script, "init-token", "--token-file", str(token)], check=True)
-        process = subprocess.Popen([*script, "serve", "--config", str(self.config), "--token-file", str(token), *options],
+        process = subprocess.Popen([*script, "serve", "--config", str(self.config), *options],
                                    env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         self.addCleanup(self.stop_server, process)
         line = process.stdout.readline()
         self.assertIn("listening on", line)
         self.base = "http://127.0.0.1:" + line.strip().rsplit(":", 1)[1]
-        self.token = token.read_text().strip()
 
     @staticmethod
     def stop_server(process):
@@ -263,17 +320,43 @@ class ServiceTests(unittest.TestCase):
 
     def api(self, path, body=None, **headers):
         data = None if body is None else json.dumps(body).encode()
-        req = Request(self.base + "/api/" + path, data=data, headers={"Authorization": "Bearer " + self.token,
-                      "Content-Type": "application/json", **headers})
+        req = Request(self.base + "/api/" + path, data=data, headers={"Content-Type": "application/json", **headers})
         with urlopen(req, timeout=18) as result:
             return json.load(result)
 
+    def test_local_network_policy(self):
+        sys.path.insert(0, str(ROOT))
+        try:
+            from binup_web import LocalAccess, LocalServer
+        finally:
+            sys.path.pop(0)
+        access = LocalAccess(aliases=["lab.home.arpa"])
+        server = SimpleNamespace(access=access)
+        for address in ("127.0.0.1", "::1", "192.168.1.42", "10.3.4.5", "172.31.255.254",
+                        "100.64.0.1", "100.127.255.254", "fd7a:115c:a1e0::1", "fe80::1%eth0",
+                        "::ffff:10.10.2.3", "169.254.1.22"):
+            self.assertTrue(LocalServer.verify_request(server, None, (address, 49152)), address)
+        for address in ("8.8.8.8", "100.128.0.1", "172.32.0.1", "192.0.2.1", "::",
+                        "::ffff:8.8.8.8", "2001:4860:4860::8888", "ff02::1", "0.0.0.0"):
+            self.assertFalse(LocalServer.verify_request(server, None, (address, 49152)), address)
+        for host in ("lab.home.arpa:9098", "localhost", "[fd7a:115c:a1e0::1]:9098", "192.168.2.3:9098"):
+            self.assertTrue(access.permits_host(host), host)
+        for host in ("other.invalid", "other.invalid@127.0.0.1", "[::1]unexpected", "127.0.0.1%extra",
+                     "localhost:bad", "localhost/path", "localhost:99999"):
+            self.assertFalse(access.permits_host(host), host)
+        self.assertTrue(LocalAccess(["2001:db8:12::/64"]).permits_ip("2001:db8:12::a"))
+        with self.assertRaises(ValueError):
+            LocalAccess(["0.0.0.0/0"])
+
     def test_web_runs_repair_cancel_and_access(self):
-        self.start_server("--bind", "127.0.0.1", "--port", "0")
-        for req, status in [({"Authorization": ""}, 401), ({"Origin": "https://elsewhere.invalid"}, 403)]:
+        # A unit from before the token-free upgrade may still pass the old option.
+        self.start_server("--bind", "127.0.0.1", "--port", "0", "--token-file", str(self.root / "unused"))
+        self.assertEqual(self.api("state")["apps"], [])
+        for req in ({"Origin": "https://elsewhere.invalid"}, {"Host": "unrelated.example"},
+                    {"Sec-Fetch-Site": "cross-site"}):
             with self.assertRaises(HTTPError) as error:
                 self.api("state", **req)
-            self.assertEqual(error.exception.code, status)
+            self.assertEqual(error.exception.code, 403)
         self.create()
         self.release("renamed.worker")
         run = self.api("runs", {"action": "update", "app": "demo"})

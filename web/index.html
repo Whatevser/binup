@@ -3,45 +3,38 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="theme-color" content="#112d28">
-  <title>Binup · Service console</title>
+  <title>Binup</title>
   <link rel="icon" href="data:,">
-  <link rel="stylesheet" href="/style.css">
-  <script src="/app.js" defer></script>
+  <link rel="stylesheet" href="style.css">
+  <script type="module" src="entry.js"></script>
 </head>
 <body>
-  <header class="mast"><div class="wrap mast-inner">
-    <div class="wordmark"><span class="mark" aria-hidden="true">›_</span>binup</div>
-    <nav id="nav" aria-label="Main" hidden>
-      <button id="nav-apps" class="navlink active">Applications</button>
-      <button id="nav-history" class="navlink">Run history</button>
-    </nav>
-    <div class="session" id="session" hidden><span id="connection">Connected</span><button id="signout" class="plain">Sign out</button></div>
-  </div></header>
-  <section id="login" class="login">
-    <h1>Open the console</h1>
-    <p>On your server, run <code>bash binup.sh web-token</code> to get your access token.</p>
-    <form id="login-form"><label for="token">Access token</label><input id="token" type="password" autocomplete="current-password" required>
-      <button class="primary">Connect</button></form>
-    <p class="error" id="login-error" role="alert"></p>
-  </section>
-  <main id="console" class="wrap" hidden>
+  <header class="page-head">
+    <div class="wrap">
+      <div class="heading"><h1>Binup</h1><span id="connection" class="offline" role="status">Connecting…</span></div>
+      <nav id="nav" aria-label="Binup">
+        <button id="nav-apps" class="navlink active" aria-current="page">Applications</button>
+        <button id="nav-history" class="navlink">Run history</button>
+      </nav>
+    </div>
+  </header>
+  <main id="console" class="wrap">
     <div id="notice" class="notice" role="alert" hidden></div>
-    <section id="apps-view">
-      <div class="title-row"><h1>Applications</h1><div class="tools">
-        <button id="check-all">Check all</button><button id="update-all">Update all</button><button id="add" class="primary">+ Add app</button>
-      </div></div>
+    <section id="apps-view" aria-label="Applications">
       <div class="registry">
         <div class="toolbar"><div class="filters" aria-label="Filter app state"><button data-filter="all" class="selected">All</button><button data-filter="active">Running</button><button data-filter="issues">Needs attention</button></div>
-          <input type="search" id="search" placeholder="Find an app…" aria-label="Find an app">
+          <div class="tools">
+            <input type="search" id="search" placeholder="Find an app…" aria-label="Find an app">
+            <button id="check-all">Check all</button><button id="update-all">Update all</button><button id="add" class="primary">Add app</button>
+          </div>
         </div>
         <div class="table-wrap"><table><thead><tr><th>Application</th><th>Version</th><th>Service</th><th>State</th><th class="end">Actions</th></tr></thead><tbody id="apps"></tbody></table></div>
         <p class="empty" id="apps-empty" hidden></p>
       </div>
     </section>
-    <section id="history-view" hidden><div class="title-row"><h1>Run history</h1></div><div class="registry" id="history"></div></section>
+    <section id="history-view" aria-label="Run history" hidden><div class="registry" id="history"></div></section>
     <section class="output" aria-label="Live command output">
-      <div class="output-head"><div class="output-heading"><span class="term-icon" aria-hidden="true">❯</span><h2>Live output</h2><span id="run-badge" class="badge muted">Idle</span></div>
+      <div class="output-head"><div class="output-heading"><h2>Live output</h2><span id="run-badge" class="badge muted">Idle</span></div>
         <button id="cancel" class="dark-button" hidden>Cancel run</button></div>
       <div class="run-caption" id="run-caption" hidden></div>
       <pre id="transcript" tabindex="0" aria-label="Command output">Output appears here when you run a command.</pre>
