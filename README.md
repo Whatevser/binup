@@ -20,6 +20,35 @@ git pull --ff-only && bash binup.sh web-install
 
 On Ubuntu and Mint, the required packages are `bash curl jq util-linux python3 tar coreutils`. The installers use your systemd user manager.
 
+## Update Binup from its own web interface
+
+Once installed, open **Settings → Update Binup** and select **Check for updates**
+to compare the running version with the current commit of
+[`Whatevser/binup`](https://github.com/Whatevser/binup)'s `main` branch.
+Select **Update Binup** to download and install the newest complete CLI, server
+and frontend without using a terminal. Your existing app registry, per-app
+policies, scheduled checks, services and web settings are preserved.
+
+The updater runs as a separate transient **systemd user unit**
+(`binup-self-update.service`) so restarting `binup-web.service` cannot kill it.
+The Settings page shows the operation's status and installer output across
+service restarts. A failed restart restores the previous web service unit.
+The updater uses the existing immutable GitHub commit archive installer.
+Requires `systemd-run --user` (part of systemd) and an active user manager.
+
+**Only the initial installation needs a shell command.** For a non-Git install,
+you may remove the optional loose launcher symlink after the web interface
+is installed:
+
+```bash
+# Adjust the path to the directory where you first downloaded binup.sh.
+test -L ~/binup/binup.sh && rm -- ~/binup/binup.sh
+```
+
+The internal `binup.sh` in `~/.local/share/binup-runtime/<commit>/` remains
+part of Binup's update and app-management backend; deleting the optional
+top-level launcher does not remove this internal runtime dependency.
+
 ## Open Binup
 
 - **Cockpit** — Sign in to the managed host as the user who installed Binup. Refresh Cockpit and choose **System → Binup** in the left sidebar. The applications, service journals, live output and interactive prompts work within the page. Cockpit carries requests to port 9098 on the selected host. The browser only needs access to Cockpit. The package lives in your user Cockpit data directory. If you install Cockpit later, rerun `bash binup.sh web-install`.
