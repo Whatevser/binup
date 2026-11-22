@@ -908,11 +908,12 @@ run_apps() {
 }
 
 list_data() {
-  local rows row svc scope unit properties key value load active sub result state
+  local rows row svc scope unit properties key value load active sub result state bin backup_present
   rows=$(config -c 'to_entries | sort_by(.key)[] |
     {name:.key, version:(.value.version // ""), service:(.value.service // ""),
      scope:(.value.scope // "system"), repo:.value.repo, bin:.value.bin,
-     pending:(.value.start_after_install == true)}') || return 1
+     pending:(.value.start_after_install == true),
+     auto_update:(.value.auto_update == true), keep_backup:(.value.keep_backup != false)}') || return 1
   while IFS= read -r row; do
     [[ -n $row ]] || continue
     svc=$(field "$row" service); scope=$(field "$row" scope)
@@ -932,7 +933,11 @@ list_data() {
         *) state=$load ;;
       esac
     fi
-    jq -c --arg state "$state" --arg sub "$sub" --arg result "$result" '. + {state:$state,sub:$sub,result:$result}' <<< "$row" || return 1
+    bin=$(field "$row" bin)
+    backup_present=false
+    if [[ $bin == /* && -f $bin.bak && ! -L $bin.bak ]]; then backup_present=true; fi
+    jq -c --arg state "$state" --arg sub "$sub" --arg result "$result" --argjson has_backup "$backup_present" \
+      '. + {state:$state,sub:$sub,result:$result,has_backup:$has_backup}' <<< "$row" || return 1
   done <<< "$rows"
 }
 list_apps() {
@@ -1211,6 +1216,9 @@ case ${1:-} in
   edit)      [[ -n ${2:-} ]] && mutate add_app "$2" || exit 1 ;;
   check)     run_apps check "${2:-all}" ;;
   update)    mutate run_apps update "${2:-all}" ;;
+  auto)      BINUP_AUTO=1 mutate run_apps auto "${2:-all}" ;;
+  policy)    [[ $# == 4 ]] && mutate set_policy "$2" "$3" "$4" || exit 1 ;;
+  cleanup)   [[ -n ${2:-} ]] && mutate clear_backups "$2" || exit 1 ;;
   list|ls)   list_apps "${2:-}" ;;
   status|logs) [[ -n ${2:-} ]] || { warn "Use $1 NAME"; exit 1; }; service_command "$2" "$1" "${3:-}" ;;
   service) [[ $# == 3 && $3 =~ ^(start|stop|restart)$ ]] || { warn 'Use service NAME start|stop|restart'; exit 1; }
