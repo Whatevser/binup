@@ -32,6 +32,9 @@ STATIC = {"/": ("index.html", "text/html"), "/entry.js": ("standalone.js", "text
           "/style.css": ("style.css", "text/css")}
 OUTPUT_LIMIT = 256 * 1024
 HISTORY_LIMIT = 12
+SELF_UPDATE_UNIT = "binup-self-update"
+SELF_UPDATE_TIMEOUT = 900
+SELF_UPDATE_STATUS_LIMIT = 16 * 1024
 
 
 class RequestError(Exception):
@@ -355,6 +358,57 @@ class Run:
             self.process.stdin.close()
 
 
+def self_update_path(config):
+    return config.with_name(config.name + ".self-update.json")
+
+
+def read_update_status(path):
+    try:
+        status = json.loads(path.read_text())
+    except (FileNotFoundError, ValueError):
+        return {}
+    return status if isinstance(status, dict) else {}
+
+
+def write_update_status(path, data):
+    draft = tempfile.NamedTemporaryFile(mode="w", dir=path.parent, delete=False)
+    try:
+        with draft:
+            json.dump(data, draft)
+        os.replace(draft.name, path)
+    finally:
+        Path(draft.name).unlink(missing_ok=True)
+
+
+def self_update_worker(config):
+    """Run outside binup-web.service's cgroup so its restart cannot kill the update."""
+    path = self_update_path(config)
+    status = dict(state="running", started=time.time(), output="", message="Installing latest main…")
+    write_update_status(path, status)
+    try:
+        result = subprocess.run(
+            ["/bin/bash", SCRIPT, "install", str(config)],
+            env=dict(os.environ, BINUP_CONF=str(config)),
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, errors="replace", timeout=SELF_UPDATE_TIMEOUT
+        )
+        status.update(state="success" if result.returncode == 0 else "error",
+                      code=result.returncode, output=result.stdout[-SELF_UPDATE_STATUS_LIMIT:],
+                      message="Binup updated successfully." if result.returncode == 0
+                              else "Binup update failed. See the installer output.")
+    except subprocess.TimeoutExpired as exc:
+        output = exc.stdout or b""
+        if isinstance(output, bytes):
+            output = output.decode("utf-8", "replace")
+        status.update(state="error", code=None, output=output[-SELF_UPDATE_STATUS_LIMIT:],
+                      message="Self-update timed out.")
+    except OSError as exc:
+        status.update(state="error", code=None, output=str(exc), message="Could not launch the self-updater.")
+    status["finished"] = time.time()
+    write_update_status(path, status)
+    return 0 if status["state"] == "success" else 1
+
+
 class Control:
     def __init__(self, config):
         self.config = config
@@ -371,6 +425,67 @@ class Control:
         except FileNotFoundError:
             self.web = {"interval_hours": 0, "next_check": None, "checks": {}}
         self.retry_after = 0
+        self.update_file = self_update_path(config)
+        self.latest_revision = None
+        self.latest_checked = None
+
+    @staticmethod
+    def installed_revision():
+        if ROOT.parent.name == "binup-runtime" and len(ROOT.name) == 40 and all(c in "0123456789abcdef" for c in ROOT.name):
+            return ROOT.name
+        if (ROOT / ".git").exists():
+            try:
+                result = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"],
+                                        capture_output=True, text=True, timeout=3)
+                if result.returncode == 0:
+                    return result.stdout.strip()
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        return None
+
+    def self_update_status(self, check=False):
+        if check:
+            result = self.command("remote-revision")
+            if result.returncode or len(result.stdout.strip()) != 40:
+                raise RequestError(503, result.stderr.strip() or "Could not read Binup's latest GitHub revision.")
+            self.latest_revision = result.stdout.strip()
+            self.latest_checked = time.time()
+        status = read_update_status(self.update_file)
+        if status.get("state") in ("queued", "running") and time.time() - status.get("started", 0) > SELF_UPDATE_TIMEOUT + 60:
+            status.update(state="error", finished=time.time(), message="Self-update was interrupted or timed out.")
+            write_update_status(self.update_file, status)
+        return dict(installed=self.installed_revision(), latest=self.latest_revision,
+                    checked=self.latest_checked, **status)
+
+    def self_update_active(self):
+        state = read_update_status(self.update_file)
+        return (state.get("state") in ("queued", "running") and
+                time.time() - state.get("started", 0) < SELF_UPDATE_TIMEOUT + 60)
+
+    def start_self_update(self):
+        with self.lock:
+            if self.stopping or any(run.summary()["code"] is None for run in self.runs.values()):
+                raise RequestError(409, "Finish the current app operation before updating Binup.")
+            old = read_update_status(self.update_file)
+            if old.get("state") in ("queued", "running") and time.time() - old.get("started", 0) < SELF_UPDATE_TIMEOUT + 60:
+                raise RequestError(409, "Binup is already updating.")
+            data = dict(state="queued", started=time.time(), message="Starting the updater…", output="")
+            write_update_status(self.update_file, data)
+            command = ["systemd-run", "--user", "--unit=" + SELF_UPDATE_UNIT,
+                       "--collect", "--property=Type=exec", "--", sys.executable,
+                       str(ROOT / "binup_web.py"), "self-update-worker", "--config", str(self.config)]
+            try:
+                result = subprocess.run(command, capture_output=True, text=True, timeout=20, env=self.env)
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                data.update(state="error", finished=time.time(), message=f"Could not start updater: {exc}")
+                write_update_status(self.update_file, data)
+                raise RequestError(503, data["message"]) from exc
+            if result.returncode:
+                data.update(state="error", finished=time.time(),
+                            message=result.stderr.strip() or "systemd-run could not start the updater.")
+                write_update_status(self.update_file, data)
+                raise RequestError(503, data["message"])
+        return self.self_update_status()
 
     def save_web(self):
         draft = tempfile.NamedTemporaryFile(mode="w", dir=self.web_file.parent, delete=False)
@@ -432,8 +547,8 @@ class Control:
         if key not in ("auto_update", "keep_backup") or type(enabled) is not bool:
             raise RequestError(400, "Choose a valid per-app setting and boolean value.")
         with self.lock:
-            if self.stopping or any(run.summary()["code"] is None for run in self.runs.values()):
-                raise RequestError(409, "Wait until the current run finishes.")
+            if self.stopping or self.self_update_active() or any(run.summary()["code"] is None for run in self.runs.values()):
+                raise RequestError(409, "Wait until the current operation finishes.")
             result = self.command("policy", name, key, "on" if enabled else "off")
         if result.returncode:
             raise RequestError(409, result.stderr.strip() or "Could not save app settings.")
@@ -443,7 +558,7 @@ class Control:
         now = time.time()
         with self.lock:
             due = self.web["next_check"]
-            if self.stopping or not due or now < max(due, self.retry_after):
+            if self.stopping or not due or now < max(due, self.retry_after) or self.self_update_active():
                 return
             if any(run.summary()["code"] is None for run in self.runs.values()):
                 return
@@ -515,6 +630,8 @@ class Control:
         else:
             argv = [action, target]
         with self.lock:
+            if self.self_update_active():
+                raise RequestError(409, "Binup is updating itself. Wait for the web service to restart.")
             if self.stopping or any(run.summary()["code"] is None for run in self.runs.values()):
                 raise RequestError(409, "A command is already running. Open its live output.")
             if action == "add" and self.web["checks"].pop(target, None) is not None:
@@ -599,6 +716,11 @@ class Handler(BaseHTTPRequestHandler):
         owner = self.headers.get("X-Binup-Run", "")
         if method == "GET" and path == "/api/state":
             return control.state()
+        if method == "GET" and path == "/api/self-update":
+            return control.self_update_status(check=query.get("check") == ["1"])
+        if method == "POST" and path == "/api/self-update":
+            self.body()
+            return control.start_self_update()
         if method == "GET" and path in ("/api/logs", "/api/status"):
             name = control.app_name(query.get("app", [""])[0])
             argv = [path.rsplit("/", 1)[1], name]
@@ -679,13 +801,15 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("serve",))
+    parser.add_argument("mode", choices=("serve", "self-update-worker"))
     parser.add_argument("--config", type=Path, default=ROOT / "binup.json")
     # Units generated by older installers pass this argument until reinstalled.
     parser.add_argument("--token-file", help=argparse.SUPPRESS)
     parser.add_argument("--bind", default="::" if socket.has_dualstack_ipv6() else "0.0.0.0")
     parser.add_argument("--port", type=int, default=9098)
     args = parser.parse_args()
+    if args.mode == "self-update-worker":
+        return self_update_worker(args.config.resolve())
     access = LocalAccess(os.environ.get("BINUP_EXTRA_NETWORKS", "").split(),
                          os.environ.get("BINUP_HOSTNAMES", "").split())
     files = {url: (mime, (ROOT / "web" / name).read_bytes()) for url, (name, mime) in STATIC.items()}
@@ -709,6 +833,6 @@ if __name__ == "__main__":
     try:
         if len(sys.argv) == 2 and os.environ.get("BINUP_ASKPASS_DIR"):
             sys.exit(sudo_askpass())
-        main()
+        sys.exit(main())
     except (OSError, ValueError) as error:
         sys.exit(str(error))

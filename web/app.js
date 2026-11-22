@@ -20,7 +20,8 @@ function ownerKey(run) {
 
 const state = {connected: false, apps: [], runs: [], view: "apps",
                filter: "all", selected: null, cursor: -1, stream: null, text: "", replaceLine: false,
-               prompt: null, workflow: null, dismissed: null, cleared: -1, journalSince: new Map(), settings: null, detail: null, detailMode: "logs", detailRequest: 0, refresh: 0, starting: false};
+               prompt: null, workflow: null, dismissed: null, cleared: -1, journalSince: new Map(), settings: null, detail: null, detailMode: "logs", detailRequest: 0, refresh: 0, starting: false,
+               selfUpdate: null, selfChecking: false, selfInstalling: false};
 
 function element(tag, text, css) {
   const node = document.createElement(tag);
@@ -202,6 +203,7 @@ async function refreshState() {
   if (!state.settings || state.settings.interval_hours !== data.settings.interval_hours)
     $("interval").value = String(data.settings.interval_hours);
   showSettings(data.settings);
+  if (state.view === "settings" && state.selfUpdate) renderSelfUpdate(state.selfUpdate);
   // Keep open row menus and keyboard focus during an ordinary status refresh.
   if (previous !== JSON.stringify(state.apps) || wasBusy !== busy() || !$("apps").childElementCount) renderApps();
   renderHistory();
@@ -419,7 +421,10 @@ function openDetail(app, mode) {
 }
 $("nav-apps").addEventListener("click", () => toggleView("apps"));
 $("nav-history").addEventListener("click", () => toggleView("history"));
-$("nav-settings").addEventListener("click", () => toggleView("settings"));
+$("nav-settings").addEventListener("click", () => {
+  toggleView("settings");
+  fetchSelfUpdate(true);
+});
 $("add").addEventListener("click", () => {
   $("setup-title").textContent = "Add an application";
   $("new-name").value = "";
@@ -491,6 +496,57 @@ $("clear-journal").addEventListener("click", async () => {
   } catch (error) { notify(error.message); }
 });
 $("earlier-journal").addEventListener("click", () => { state.journalSince.delete(state.detail.name); detailMode("logs"); });
+function renderSelfUpdate(info) {
+  state.selfUpdate = info;
+  const revision = value => value ? value.slice(0, 7) : "Unknown";
+  $("self-installed").textContent = "Installed: " + revision(info.installed);
+  $("self-latest").textContent = "GitHub main: " + (info.latest ? revision(info.latest) : "Not checked");
+  const phase = info.state || "idle";
+  const running = ["queued", "running"].includes(phase);
+  const current = Boolean(info.latest && info.installed === info.latest);
+  $("self-check").disabled = running || state.selfChecking || state.selfInstalling;
+  $("self-install").disabled = running || state.selfChecking || state.selfInstalling ||
+    busy() || !info.latest || current;
+  let message = info.message || (current ? "Already on the latest revision." :
+    info.latest ? "Update available." : "Check GitHub for an update.");
+  if (running) message = "Updating Binup… This page may disconnect briefly while the service restarts.";
+  $("self-update-status").textContent = message;
+  $("self-update-output").textContent = info.output || "";
+  $("self-update-output").hidden = !info.output;
+}
+async function fetchSelfUpdate(check = false) {
+  if (state.selfChecking) return;
+  state.selfChecking = check;
+  if (state.selfUpdate) renderSelfUpdate(state.selfUpdate);
+  try {
+    const previous = state.selfUpdate?.state;
+    const info = await api("self-update" + (check ? "?check=1" : ""));
+    renderSelfUpdate(info);
+    if (["queued", "running"].includes(previous) && info.state === "success") {
+      window.location.reload(); // The new server serves the updated frontend assets.
+    }
+  } catch (error) {
+    $("self-update-status").textContent = error.message;
+  } finally {
+    state.selfChecking = false;
+    if (state.selfUpdate) renderSelfUpdate(state.selfUpdate);
+  }
+}
+$("self-check").addEventListener("click", () => fetchSelfUpdate(true));
+$("self-install").addEventListener("click", async () => {
+  if (state.selfInstalling || busy()) return;
+  if (!confirm("Update Binup from Whatevser/binup main? The dashboard will restart. Your app registry is preserved.")) return;
+  state.selfInstalling = true;
+  if (state.selfUpdate) renderSelfUpdate(state.selfUpdate);
+  try {
+    renderSelfUpdate(await api("self-update", {}));
+  } catch (error) {
+    $("self-update-status").textContent = error.message;
+  } finally {
+    state.selfInstalling = false;
+    if (state.selfUpdate) renderSelfUpdate(state.selfUpdate);
+  }
+});
 function showSettings(settings) {
   state.settings = settings;
   $("schedule-status").textContent = !settings.interval_hours ? "Automatic checks are off." :
@@ -525,6 +581,16 @@ async function watchApps() {
   catch (error) { reportConnection(error); }
   finally { setTimeout(watchApps, 8000); }
 }
+async function watchSelfUpdate() {
+  try {
+    if (!document.hidden && (state.view === "settings" ||
+       ["queued", "running"].includes(state.selfUpdate?.state))) {
+      await fetchSelfUpdate();
+    }
+  } finally {
+    setTimeout(watchSelfUpdate, 2500);
+  }
+}
 async function watchService() {
   try { if ($("service-dialog").open && $("follow").checked && !document.hidden) await loadDetail(); }
   finally { setTimeout(watchService, 2500); }
@@ -542,4 +608,5 @@ export function start(request, preferredTheme = () => "auto") {
   renderApps();
   watchApps();
   watchService();
+  watchSelfUpdate();
 }

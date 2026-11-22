@@ -46,6 +46,14 @@
           <button class="primary" id="save-schedule">Save</button></div>
         <p id="schedule-status" role="status"></p>
       </form>
+      <div class="self-update-settings">
+        <h2>Update Binup</h2>
+        <p>Upgrade the CLI and web dashboard directly from <a href="https://github.com/Whatevser/binup" target="_blank" rel="noopener noreferrer">Whatevser/binup</a> (main). Your apps and configuration stay intact. The web service restarts after installation.</p>
+        <div class="self-update-revisions"><span id="self-installed">Installed: checking…</span><span id="self-latest">Latest: not checked</span></div>
+        <div class="settings-controls"><button id="self-check" type="button">Check for updates</button><button id="self-install" type="button" class="primary" disabled>Update Binup</button></div>
+        <p id="self-update-status" role="status"></p>
+        <pre id="self-update-output" tabindex="0" hidden aria-label="Binup self-update output"></pre>
+      </div>
       <div class="backup-settings"><h2>Rollback backups</h2><p>Each update keeps one <code>.bak</code> copy by default. Change retention in an app's More menu, or delete existing backups now.</p><button id="clear-backups" type="button">Clear all backups</button></div>
     </section>
     <section class="output" aria-label="Live command output">
