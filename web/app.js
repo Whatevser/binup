@@ -522,7 +522,7 @@ async function fetchSelfUpdate(check = false) {
     const previous = state.selfUpdate?.state;
     const info = await api("self-update" + (check ? "?check=1" : ""));
     renderSelfUpdate(info);
-    if (previous === "running" && info.state === "success") {
+    if (["queued", "running"].includes(previous) && info.state === "success") {
       window.location.reload(); // The new server serves the updated frontend assets.
     }
   } catch (error) {
