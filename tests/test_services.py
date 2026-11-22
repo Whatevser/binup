@@ -253,39 +253,28 @@ class ServiceTests(unittest.TestCase):
 
     @unittest.skipIf(os.geteuid() == 0, "web installer runs as an unprivileged account")
     def test_web_unit_install_and_remove(self):
-        alternate = self.root / "live $config %.json"
-        alternate.write_text("{}")
-        self.config.write_text("{broken")
-        self.cli("web-install", str(alternate))
-        self.assertFalse((self.root / "config/binup/web.token").exists())
+        self.cli("web-install")
         unit = self.unit().with_name("binup-web.service")
-        text = unit.read_text()
+        content = unit.read_text()
         persistent = self.root / "config/binup/binup.json"
         stable = self.root / "data/binup/current"
         self.assertEqual(json.loads(persistent.read_text()), {})
-        self.assertFalse(alternate.exists())
-        self.assertIn(str(persistent), text)
-        self.assertIn(str(stable / "binup_web.py"), text)
+        self.assertIn(str(persistent), content)
+        self.assertIn(str(stable / "binup_web.py"), content)
         self.assertEqual(stable.resolve(), ROOT)
-        self.assertIn("KillMode=mixed", text)
-        self.assertNotIn("--token-file", text)
+        self.assertIn("KillMode=mixed", content)
         if shutil.which("systemd-analyze"):
             subprocess.run(["systemd-analyze", "verify", str(unit)], check=True, capture_output=True)
-        self.cli("web-install", str(alternate))
-        alternate_env = dict(self.env, BINUP_CONF=str(alternate))
-        self.assertIn("Web UI action", self.cli(answers=["9", "4", "8"], env=alternate_env))
-        previous_env = self.env.copy()
-        del previous_env["BINUP_CONF"]
-        legacy_unit = [line + ' "--token-file" "/old/token"' if line.startswith("ExecStart=") else line
-                       for line in text.splitlines()]
-        unit.write_text("\n".join(legacy_unit) + "\n")
-        self.cli("web-install", env=previous_env)
-        self.assertIn(str(persistent), unit.read_text())
-        self.assertNotIn("--token-file", unit.read_text())
+        # Current installed Binup passes this one canonical argument to the
+        # next version's installer; no arbitrary config paths are supported.
+        self.cli("web-install", str(persistent))
+        self.assertIn("Web UI action", self.cli(answers=["9", "4", "8"]))
+        self.assertIn("custom registry paths are unsupported",
+                      self.cli("web-install", str(self.config), code=1))
         self.cli("web-uninstall")
         self.assertFalse(unit.exists())
         unit.write_text("[Service]\nExecStart=/bin/sleep infinity\n")
-        self.assertIn("belongs to another service", self.cli("web-install", str(alternate), code=1))
+        self.assertIn("belongs to another service", self.cli("web-install", code=1))
         self.assertIn("/bin/sleep", unit.read_text())
 
     @unittest.skipIf(os.geteuid() == 0, "web setup runs as an unprivileged account")
@@ -308,86 +297,62 @@ class ServiceTests(unittest.TestCase):
         self.assertTrue((package / "keep").is_file())
 
     @unittest.skipIf(os.geteuid() == 0, "web setup runs as an unprivileged account")
-    def test_one_file_upgrade_preserves_registry(self):
-        loose = self.root / "my tools"
+    def test_fresh_bootstrap_and_self_upgrade_keep_registry(self):
+        loose = self.root / "bootstrap"
         loose.mkdir()
-        launcher, live = loose / "binup.sh", loose / "binup.json"
-        launcher.write_text("#!/bin/bash\n# previous version\n")
-        live.write_text('{"saved":{"service":"","repo":"org/app","custom":true}}\n')
-        live_web = live.with_name(live.name + ".web.json")
-        live_web.write_text('{"interval_hours":6,"next_check":null,"checks":{}}')
-        live_status = live.with_name(live.name + ".self-update.json")
-        live_status.write_text('{"state":"success","message":"Previous upgrade"}')
-        before = live.read_bytes()
-        bootstrap = loose / "binup-upgrade.sh"
-        shutil.copyfile(ROOT / "binup.sh", bootstrap)
-        revision = "1" * 40
-        (self.root / "main-revision").write_text(revision)
-        with tarfile.open(self.root / "bundle.tar.gz", "w:gz") as archive:
-            for file in ("binup.sh", "binup_web.py", "web", "binup.json"):
-                archive.add(ROOT / file, f"binup-{revision}/{file}")
+        script = loose / "binup-install.sh"
+        shutil.copyfile(ROOT / "binup.sh", script)
         env = self.env.copy()
-        del env["BINUP_CONF"]
+        env.pop("BINUP_CONF", None)
         persistent = self.root / "config/binup/binup.json"
         stable = self.root / "data/binup/current"
-        for _ in range(2):
-            subprocess.run(["bash", str(bootstrap), "install"], env=env, check=True, capture_output=True)
-            self.assertTrue(persistent.exists())
-            self.assertEqual(persistent.read_bytes(), before)
-            self.assertEqual(stable.resolve().name, revision)
-            self.assertFalse((loose / "binup.sh").is_symlink())  # No loose launcher required.
-            proc = subprocess.run(["bash", str(stable / "binup.sh"), "list", "--json"],
-                                  env=env, capture_output=True, check=True, text=True)
-            self.assertEqual(json.loads(proc.stdout)[0]["name"], "saved")
-        unit = self.unit().with_name("binup-web.service").read_text()
-        self.assertIn(str(persistent), unit)
-        self.assertIn(str(stable / "binup_web.py"), unit)
-        self.assertNotIn("--token-file", unit)
-        self.assertFalse(live.exists())
-        self.assertFalse(live_web.exists())
-        self.assertFalse(live_status.exists())
-        self.assertEqual(json.loads(persistent.with_name("binup.json.web.json").read_text())["interval_hours"], 6)
-        self.assertEqual(json.loads(persistent.with_name("binup.json.self-update.json").read_text())["message"], "Previous upgrade")
-        installed = stable.resolve()
+
+        def build_bundle(revision):
+            (self.root / "main-revision").write_text(revision)
+            with tarfile.open(self.root / "bundle.tar.gz", "w:gz") as archive:
+                for name in ("binup.sh", "binup_web.py", "web"):
+                    archive.add(ROOT / name, f"binup-{revision}/{name}")
+
+        build_bundle("1" * 40)
+        subprocess.run(["bash", str(script), "install"], env=env, check=True, capture_output=True)
+        self.assertEqual(json.loads(persistent.read_text()), {})
+        self.assertEqual(stable.resolve().name, "1" * 40)
+        self.assertTrue((stable / "binup_web.py").exists())
+        self.assertFalse((loose / "binup.sh").exists())
+        unit = self.unit().with_name("binup-web.service")
+        before_unit = unit.read_bytes()
+        self.assertIn(str(stable / "binup_web.py"), before_unit.decode())
+        self.assertIn(str(persistent), before_unit.decode())
+        persistent.write_text('{"saved":{"repo":"org/app","bin":"/tmp/test","custom":true}}\n')
+        web = persistent.with_name("binup.json.web.json")
+        web.write_text('{"interval_hours":6,"next_check":null,"checks":{}}')
+        progress = persistent.with_name("binup.json.self-update.json")
+        progress.write_text('{"state":"success","message":"Current upgrade"}')
+        saved = [p.read_bytes() for p in (persistent, web, progress)]
+        # Repeating an install reuses the same release and leaves all data intact.
+        subprocess.run(["bash", str(script), "install"], env=env, check=True, capture_output=True)
+        self.assertEqual([p.read_bytes() for p in (persistent, web, progress)], saved)
         self.assertEqual((self.root / "calls").read_text().count("https://codeload.github.com/"), 1)
-        (self.root / "main-revision").write_text("2" * 40)
+        build_bundle("2" * 40)
+        subprocess.run(["bash", str(script), "install"], env=env, check=True, capture_output=True)
+        self.assertEqual(stable.resolve().name, "2" * 40)
+        self.assertEqual(unit.read_bytes(), before_unit)
+        self.assertEqual([p.read_bytes() for p in (persistent, web, progress)], saved)
+        installed = stable.resolve()
+        (self.root / "main-revision").write_text("3" * 40)
         (self.root / "bundle.tar.gz").write_bytes(b"incomplete download")
-        rejected = subprocess.run(["bash", str(bootstrap), "install"], env=env, capture_output=True)
+        rejected = subprocess.run(["bash", str(script), "install"], env=env, capture_output=True)
         self.assertNotEqual(rejected.returncode, 0)
         self.assertEqual(stable.resolve(), installed)
-        self.assertEqual(persistent.read_bytes(), before)
+        self.assertEqual([p.read_bytes() for p in (persistent, web, progress)], saved)
 
     @unittest.skipIf(os.geteuid() == 0, "web installer runs as an unprivileged account")
-    def test_migrate_existing_scripts_config_from_old_service(self):
-        old = self.root / "scripts/binup.json"
-        old.parent.mkdir()
-        old.write_text('{"qbit":{"bin":"/home/user/bin/qbittorrent-nox","repo":"owner/qbit","version":"v4"}}')
-        old_web = old.with_name(old.name + ".web.json")
-        old_web.write_text('{"interval_hours":24,"next_check":12345,"checks":{}}')
-        legacy_unit = self.unit().with_name("binup-web.service")
-        legacy_unit.parent.mkdir(parents=True, exist_ok=True)
-        legacy_unit.write_text('# Generated by binup web-install\n[Service]\n' +
-                               'ExecStart=/usr/bin/python3 /tmp/old/binup_web.py serve --config "' +
-                               str(old) + '"\n')
-        self.cli("web-install")
-        persistent = self.root / "config/binup/binup.json"
-        self.assertEqual(json.loads(persistent.read_text())["qbit"]["version"], "v4")
-        self.assertEqual(json.loads(persistent.with_name("binup.json.web.json").read_text())["interval_hours"], 24)
-        self.assertFalse(old.exists())
-        self.assertFalse(old_web.exists())
-        self.assertIn(str(persistent), legacy_unit.read_text())
-        self.assertIn(str(self.root / "data/binup/current/binup_web.py"), legacy_unit.read_text())
-
-    @unittest.skipIf(os.geteuid() == 0, "web installer runs as an unprivileged account")
-    def test_conflicting_persistent_config_is_not_overwritten(self):
-        old = self.root / "old.json"
-        old.write_text('{"existing":{"version":"one"}}')
+    def test_invalid_persistent_registry_is_refused(self):
         persistent = self.root / "config/binup/binup.json"
         persistent.parent.mkdir(parents=True)
-        persistent.write_text('{"existing":{"version":"two"}}')
-        self.assertIn("Config conflict", self.cli("web-install", str(old), code=1))
-        self.assertEqual(json.loads(persistent.read_text())["existing"]["version"], "two")
-        self.assertTrue(old.exists())
+        persistent.write_text("{broken")
+        self.assertIn("Invalid config", self.cli("web-install", code=1))
+        self.assertEqual(persistent.read_text(), "{broken")
         self.assertFalse(self.unit().with_name("binup-web.service").exists())
 
     def start_server(self, *options):
@@ -453,13 +418,14 @@ class ServiceTests(unittest.TestCase):
         fake_script = self.root / "fake-update.sh"
         binup_web.SCRIPT = str(fake_script)
         fake_script.write_text("""#!/bin/bash
-printf "Upgraded %s\\n" "$2"
+printf "Upgraded %s args=%s\\n" "$BINUP_CONF" "$#"
 exit 0
 """)
         self.assertEqual(binup_web.self_update_worker(self.config), 0)
         status = binup_web.read_update_status(binup_web.self_update_path(self.config))
         self.assertEqual(status["state"], "success")
         self.assertIn(str(self.config), status["output"])
+        self.assertIn("args=1", status["output"])
         self.assertEqual(status["code"], 0)
         fake_script.write_text("""#!/bin/bash
 echo "Upgrade rejected"
@@ -484,25 +450,6 @@ exit 22
         self.assertEqual(self.unit().with_name("binup-web.service").read_bytes(), old_unit)
         self.assertEqual(stable.resolve(), previous)
         self.assertEqual((self.root / "user-binup-web.service.state").read_text(), "active")
-
-    def test_import_legacy_self_update_result_after_migration(self):
-        sys.path.insert(0, str(ROOT))
-        try:
-            from binup_web import Control, read_update_status, self_update_path
-        finally:
-            sys.path.pop(0)
-        legacy = self.root / "scripts/binup.json.self-update.json"
-        legacy.parent.mkdir()
-        status_path = self_update_path(self.config)
-        status_path.write_text(json.dumps({"state": "running", "started": 42,
-                                           "legacy_path": str(legacy)}))
-        legacy.write_text(json.dumps({"state": "success", "started": 42,
-                                      "output": "Installed new runtime", "finished": 50}))
-        summary = Control(self.config).self_update_status()
-        self.assertEqual(summary["state"], "success")
-        self.assertIn("Installed new runtime", summary["output"])
-        self.assertFalse(legacy.exists())
-        self.assertNotIn("legacy_path", read_update_status(status_path))
 
     def test_local_network_policy(self):
         sys.path.insert(0, str(ROOT))
@@ -741,8 +688,7 @@ exit 22
         self.assertIsNone(cancelled["prompt"])
 
     def test_web_runs_repair_cancel_and_access(self):
-        # A unit from before the token-free upgrade may still pass the old option.
-        self.start_server("--bind", "127.0.0.1", "--port", "0", "--token-file", str(self.root / "unused"))
+        self.start_server("--bind", "127.0.0.1", "--port", "0")
         self.assertEqual(self.api("state")["apps"], [])
         for req in ({"Origin": "https://elsewhere.invalid"}, {"Host": "unrelated.example"},
                     {"Sec-Fetch-Site": "cross-site"}):

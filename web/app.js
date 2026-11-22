@@ -83,7 +83,7 @@ function versionCell(row, app) {
   const current = check?.status === "current";
   const available = check?.status === "available";
   const latest = check?.latest;
-  // A digest can confirm the actual installed build even when a legacy registry tag is missing.
+  // A verified build digest can confirm the installed release even without a recorded tag.
   const td = cell(row, (current ? latest : app.version) || "Unknown", "version " +
     (current ? "good" : available ? "bad" : check ? "waiting" : "muted"));
   let label = "Not checked";
