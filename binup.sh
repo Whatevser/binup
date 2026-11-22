@@ -1253,7 +1253,16 @@ case ${1:-} in -h|--help|help) sed -n '2,/^$/{ /^#/s/^# \{0,1\}//p; }' "$SELF"; 
 case ${1:-} in
   web-uninstall) web_setup "$1"; exit $? ;;
   install|web-install)
-    [[ $# == 1 ]] || { warn "Use $1 without a configuration path (registry: $PERSISTENT_CONF)."; exit 1; }
+    # One safe handoff: the currently deployed updater invokes the next
+    # release's web-install with the canonical registry path as argument.
+    # No alternate registry paths, discovery, or migrations are supported.
+    if [[ $# == 2 && $1 == web-install ]]; then
+      [[ $(realpath -m -- "$2") == "$PERSISTENT_CONF" ]] ||
+        { warn "Binup uses only $PERSISTENT_CONF; custom registry paths are unsupported."; exit 1; }
+    elif [[ $# != 1 ]]; then
+      warn "Use $1 without a config argument (registry: $PERSISTENT_CONF)."
+      exit 1
+    fi
     CONF=$(realpath -m -- "$PERSISTENT_CONF") || exit 1
     ensure_registry || exit 1
     ;;
