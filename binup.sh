@@ -1149,7 +1149,8 @@ finish_config_migration() {
 # Replace a symlink in one rename: systemd and Cockpit see either the old
 # complete runtime or the new complete runtime, never a half-installed tree.
 switch_runtime() {
-  local root=$1 destination=$2 link=$root/current draft
+  local root=$1 destination=$2 link draft
+  link=$root/current
   mkdir -p -- "$root" || return 1
   if [[ -e $link && ! -L $link ]]; then
     fail "Unmanaged runtime path blocks Binup: $link"; return 1
@@ -1230,7 +1231,7 @@ web_setup() (
   python=$(type -P python3) || return 1
   mkdir -p -- "$folder" || return 1
   draft=$(mktemp -- "$folder/.binup-web.XXXXXXXX") || return 1
-  trap 'rm -f -- "$draft" "$previous"' EXIT
+  trap '[[ -z ${draft:-} ]] || rm -f -- "$draft"; [[ -z ${previous:-} ]] || rm -f -- "$previous"' EXIT
   if [[ -L $stable ]]; then
     old_runtime=$(readlink -- "$stable") || return 1
   elif [[ -e $stable ]]; then
