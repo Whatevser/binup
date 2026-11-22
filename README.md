@@ -1,24 +1,58 @@
 # binup
 
-Update standalone Linux programs from GitHub releases, including single binaries and archives. Run `bash binup.sh` for the interactive menu. Binup uses `binup.json` beside the script, or the path in `BINUP_CONF`. The included JSON contains example entries with machine-specific paths.
+Update standalone Linux applications from GitHub releases, including single binaries and archives. Binup has a web dashboard and an optional Bash CLI.
 
-## Upgrade from the basic script
+## Installation and persistent paths
 
-Run this **as your normal user from the folder containing your current `binup.sh` and `binup.json`**.
-
-```bash
-curl -fsSLo binup-upgrade.sh https://raw.githubusercontent.com/Whatevser/binup/main/binup.sh && bash binup-upgrade.sh install "$PWD/binup.json"
-```
-
-The installer downloads the matching CLI, server and UI together. It enables `binup-web.service`, adds Binup to Cockpit when installed, and points the old `binup.sh` at the installed version. Your apps, matching rules and installed versions stay in the same JSON. For subsequent upgrades run `bash binup.sh install` from that folder. Loose-script installations use curl and tar and keep their runtime under `~/.local/share/binup-runtime`, or `$XDG_DATA_HOME/binup-runtime` if configured.
-
-If you already use a Git checkout, update it and install directly from there. A reinstall reuses the registry from the existing Binup user service. Pass a JSON path to choose a different registry.
+On Ubuntu or Linux Mint, install dependencies, then install as your **normal user**:
 
 ```bash
-git pull --ff-only && bash binup.sh web-install
+sudo apt install -y bash curl jq python3 tar util-linux coreutils
+curl -fsSLo /tmp/binup-install.sh https://raw.githubusercontent.com/Whatevser/binup/main/binup.sh
+bash /tmp/binup-install.sh install
+rm -- /tmp/binup-install.sh
 ```
 
-On Ubuntu and Mint, the required packages are `bash curl jq util-linux python3 tar coreutils`. The installers use your systemd user manager.
+The installer downloads the matching CLI, web server and dashboard, enables
+`binup-web.service` in the systemd **user** manager, and integrates with Cockpit
+when installed. No Git checkout or long-lived copy of the installer is required.
+
+**Permanent paths** (honoring `XDG_CONFIG_HOME` and `XDG_DATA_HOME`):
+
+| Purpose | Default path |
+| --- | --- |
+| App registry and policies | `~/.config/binup/binup.json` |
+| Check schedule and results | `~/.config/binup/binup.json.web.json` |
+| Binup self-update status | `~/.config/binup/binup.json.self-update.json` |
+| Stable web runtime entrypoint | `~/.local/share/binup/current/binup_web.py` |
+| Downloaded immutable releases | `~/.local/share/binup-runtime/<commit>/` |
+
+The `current` component is an atomically updated symlink. This keeps the
+web service's `ExecStart` **unchanged** between releases, like other services
+that launch executables from a stable path. The CLI remains available at
+`~/.local/share/binup/current/binup.sh`, without another shell script in
+your scripts directory.
+
+### Migrating an existing installation
+
+**Web self-update automatically migrates** the registry from the path recorded
+in the existing `binup-web.service`. For example, an existing
+`~/scripts/binup.json` is moved to `~/.config/binup/binup.json` along with
+its `.web.json` and `.self-update.json` files. The files are copied and checked
+first; the original files are removed **only after the new web service starts**.
+If the destination contains different data, the installer stops with a
+conflict instead of overwriting it. On a failed service restart the old unit
+and runtime symlink are restored.
+
+If no existing Binup service is installed, a legacy registry beside the
+installer is discovered automatically, or you can specify its path:
+
+```bash
+bash /tmp/binup-install.sh install "$HOME/scripts/binup.json"
+```
+
+Use `systemctl --user cat binup-web.service` to verify the new stable command
+and `--config` path.
 
 ## Update Binup from its own web interface
 
@@ -36,24 +70,15 @@ service restarts. A failed restart restores the previous web service unit.
 The updater uses the existing immutable GitHub commit archive installer.
 Requires `systemd-run --user` (part of systemd) and an active user manager.
 
-**Only the initial installation needs a shell command.** For a non-Git install,
-you may remove the optional loose launcher symlink after the web interface
-is installed:
-
-```bash
-# Adjust the path to the directory where you first downloaded binup.sh.
-test -L ~/binup/binup.sh && rm -- ~/binup/binup.sh
-```
-
-The internal `binup.sh` in `~/.local/share/binup-runtime/<commit>/` remains
-part of Binup's update and app-management backend; deleting the optional
-top-level launcher does not remove this internal runtime dependency.
+**Only initial installation needs a shell command.** Subsequent updates work
+through the dashboard. The internal `binup.sh` remains part of Binup's
+app-management backend, reachable through the stable `current` path.
 
 ## Open Binup
 
-- **Cockpit** — Sign in to the managed host as the user who installed Binup. Refresh Cockpit and choose **System → Binup** in the left sidebar. The applications, service journals, live output and interactive prompts work within the page. Cockpit carries requests to port 9098 on the selected host. The browser only needs access to Cockpit. The package lives in your user Cockpit data directory. If you install Cockpit later, rerun `bash binup.sh web-install`.
+- **Cockpit** — Sign in to the managed host as the user who installed Binup. Refresh Cockpit and choose **System → Binup** in the left sidebar. The applications, service journals, live output and interactive prompts work within the page. Cockpit carries requests to port 9098 on the selected host. The browser only needs access to Cockpit. The package lives in your user Cockpit data directory. If you install Cockpit later, rerun `bash ~/.local/share/binup/current/binup.sh web-install`.
 - **Standalone** — Open `http://<LAN-or-VPN-IP>:9098/`. The page opens immediately on an allowed connection. Binup accepts loopback, private LAN IPs, Tailscale’s `100.64.0.0/10`, link-local addresses and IPv6 unique-local addresses. This covers WireGuard and ZeroTier networks using those ranges. IPv6 is enabled when the host supports a dual-stack listener.
-- **Terminal** — Run `bash binup.sh` for the app menu. **9 · Web UI** installs the service and Cockpit page, shows the service status, or uninstalls both. Your registry and managed app units are kept.
+- **Terminal** — Run `bash ~/.local/share/binup/current/binup.sh` for the app menu. **9 · Web UI** installs the service and Cockpit page, shows the service status, or uninstalls both. Your registry and managed app units are kept.
 
 Anyone who can reach the standalone service from an allowed network can operate it as the installing user. It checks the actual TCP peer. Keep a public reverse proxy or port-forward that rewrites clients to a trusted source away from this port. Use Cockpit or your VPN for remote access.
 
@@ -65,7 +90,7 @@ Environment="BINUP_EXTRA_NETWORKS=2001:db8:1234::/64"
 Environment="BINUP_HOSTNAMES=server.example-tailnet.ts.net"
 ```
 
-Replace the example prefix with your actual private tunnel's routed prefix. To start the service at boot and keep it after logout, use `loginctl enable-linger "$USER"`. Read its own logs with `journalctl --user-unit=binup-web.service -n 100 --no-pager`. Remove the service and sidebar entry with `bash binup.sh web-uninstall`.
+Replace the example prefix with your actual private tunnel's routed prefix. To start the service at boot and keep it after logout, use `loginctl enable-linger "$USER"`. Read its own logs with `journalctl --user-unit=binup-web.service -n 100 --no-pager`. Remove the service and sidebar entry with `bash ~/.local/share/binup/current/binup.sh web-uninstall`.
 
 ## Manage apps and services
 
@@ -77,7 +102,7 @@ Replace the example prefix with your actual private tunnel's routed prefix. To s
 - The version column shows the last check for each app. Green means Binup verified the installed build. Red shows an available update, missing binary, or a build that needs verification. Unchecked versions are gray. A failed lookup shows an error. Use **Check all** for an immediate check, or set **Settings → Automatic update checks** to 1, 6, 12, or 24 hours. The default is off. The user service checks while the browser is closed and leaves installation to you. The schedule and results are saved next to your registry in `<registry filename>.web.json`.
 - **Clear output** clears the selected run’s transcript and continues streaming. **Run history → Clear completed runs** removes finished runs from the 12-run session history. **Logs → Clear view** shows each new service journal entry from that moment. **Show earlier** restores the recent journal entries.
 
-The CLI and web UI can share the same registry and writer lock. Set `BINUP_CONF` to the path printed by `web-install` when using the CLI from a different checkout. The web service runs as your user. For protected paths such as `/usr/local/bin/restic` and system services, start the action in Cockpit or in the standalone UI from any allowed LAN or VPN address. A private IP or the server’s local hostname works over HTTP. When sudo asks, enter your Linux password in the masked dialog. The tab that started the run can resume it after a refresh. If you close that tab, you can cancel the run from another tab and retry. Passwords go directly to sudo’s askpass helper and are excluded from transcripts and run history. On plain HTTP, the password travels unencrypted at the HTTP layer. System journal visibility follows the account's journal permissions.
+The CLI and web UI can share the same registry and writer lock. The default CLI and web registry is `~/.config/binup/binup.json`; `BINUP_CONF` can override the CLI path when needed. The web service runs as your user. For protected paths such as `/usr/local/bin/restic` and system services, start the action in Cockpit or in the standalone UI from any allowed LAN or VPN address. A private IP or the server’s local hostname works over HTTP. When sudo asks, enter your Linux password in the masked dialog. The tab that started the run can resume it after a refresh. If you close that tab, you can cancel the run from another tab and retry. Passwords go directly to sudo’s askpass helper and are excluded from transcripts and run history. On plain HTTP, the password travels unencrypted at the HTTP layer. System journal visibility follows the account's journal permissions.
 
 ### Automatic updates and rollback backup cleanup
 
