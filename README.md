@@ -33,26 +33,16 @@ that launch executables from a stable path. The CLI remains available at
 `~/.local/share/binup/current/binup.sh`, without another shell script in
 your scripts directory.
 
-### Migrating an existing installation
+Binup always uses this persistent registry for the web service and installer.
+Reinstalling and self-updating preserve the registry and its sidecar files.
+Installation rejects an invalid existing registry rather than overwriting it.
+Failed service restarts restore the previous web unit and runtime symlink.
 
-**Web self-update automatically migrates** the registry from the path recorded
-in the existing `binup-web.service`. For example, an existing
-`~/scripts/binup.json` is moved to `~/.config/binup/binup.json` along with
-its `.web.json` and `.self-update.json` files. The files are copied and checked
-first; the original files are removed **only after the new web service starts**.
-If the destination contains different data, the installer stops with a
-conflict instead of overwriting it. On a failed service restart the old unit
-and runtime symlink are restored.
-
-If no existing Binup service is installed, a legacy registry beside the
-installer is discovered automatically, or you can specify its path:
+To inspect the installed service:
 
 ```bash
-bash /tmp/binup-install.sh install "$HOME/scripts/binup.json"
+systemctl --user cat binup-web.service
 ```
-
-Use `systemctl --user cat binup-web.service` to verify the new stable command
-and `--config` path.
 
 ## Update Binup from its own web interface
 
@@ -126,7 +116,7 @@ backups** deletes these copies for registered apps only; neither action
 changes a running service or removes any unregistered files.
 
 Per-app options are stored in `binup.json` as `auto_update` (default `false`)
-and `keep_backup` (default `true`). Older registries need no migration.
+and `keep_backup` (default `true`). Existing apps retain their individual settings.
 They can also be managed from the terminal:
 
 ```bash
