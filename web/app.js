@@ -1,7 +1,7 @@
 "use strict";
 
 const $ = id => document.getElementById(id);
-const labels = {add: "Add", edit: "Edit", check: "Check", update: "Update", reinstall: "Reinstall",
+const labels = {add: "Add", edit: "Edit", check: "Check", update: "Update", reinstall: "Reinstall", cleanup: "Clear backup",
                 remove: "Remove", start: "Start", stop: "Stop", restart: "Restart"};
 let api;
 // Only the initiating tab can answer an interactive run, including after a refresh.
@@ -43,7 +43,7 @@ function busy() { return !state.connected || state.starting || state.runs.some(r
 function runState(run) {
   if (run.code === null) return [run.cancelling ? "Cancelling" : "Running", "waiting"];
   if (run.code === 0) return ["Completed", "good"];
-  if (run.action === "check" && run.code === 10) return ["Update available", "waiting"];
+  if (["check", "auto"].includes(run.action) && run.code === 10) return ["Update available", "waiting"];
   if (run.cancelling || [129, 130, 143, -2, -15].includes(run.code)) return ["Cancelled", "muted"];
   return ["Failed · " + run.code, "bad"];
 }
@@ -96,7 +96,17 @@ function versionCell(row, app) {
   if (check) td.title = ["Checked " + new Date(check.checked * 1000).toLocaleString(), check.reason].filter(Boolean).join(" · ");
 }
 function runLabel(run) {
-  return (run.scheduled ? "Scheduled check" : labels[run.action]) + " · " + run.target;
+  return (run.scheduled ? "Scheduled maintenance" : labels[run.action]) + " · " + run.target;
+}
+async function savePolicy(app, key, enabled) {
+  if (busy()) return;
+  try {
+    await api("app-settings", {app, key, enabled});
+    await refreshState();
+  } catch (error) {
+    notify(error.message);
+    refreshState().catch(reportConnection);
+  }
 }
 function renderApps() {
   const term = $("search").value.trim().toLowerCase();
@@ -108,6 +118,7 @@ function renderApps() {
   const rows = document.createDocumentFragment();
   const locked = busy();
   for (const id of ["check-all", "update-all", "add"]) $(id).disabled = locked;
+  $("clear-backups").disabled = locked || !state.apps.some(app => app.has_backup);
   for (const app of visible) {
     const row = element("tr");
     const name = cell(row);
@@ -119,6 +130,16 @@ function renderApps() {
     status.append(badge(serviceState(app)));
     if (app.result && app.result !== "success") status.append(element("small", app.result));
     status.title = [app.state, app.sub, app.result].filter(Boolean).join(" / ");
+    const policyCell = cell(row);
+    const toggle = element("label", undefined, "auto-toggle");
+    const checkbox = element("input");
+    checkbox.type = "checkbox";
+    checkbox.checked = app.auto_update;
+    checkbox.disabled = locked;
+    checkbox.setAttribute("aria-label", "Automatically update " + app.name);
+    checkbox.addEventListener("change", () => savePolicy(app.name, "auto_update", checkbox.checked));
+    toggle.append(checkbox, element("span", app.auto_update ? "On" : "Off"));
+    policyCell.append(toggle);
     const actions = element("div", undefined, "row-actions");
     actions.append(button("Update", () => startRun("update", app.name), locked));
     if (app.service) actions.append(button("Logs", () => openDetail(app, "logs")));
@@ -132,6 +153,12 @@ function renderApps() {
     }
     item("Check for updates", () => startRun("check", app.name));
     item("Edit settings", () => startRun("edit", app.name));
+    item("Keep rollback backup: " + (app.keep_backup ? "On" : "Off"),
+      () => savePolicy(app.name, "keep_backup", !app.keep_backup));
+    item("Clear saved backup", () => {
+      if (confirm("Delete " + app.name + "'s .bak rollback file? This cannot be undone."))
+        startRun("cleanup", app.name);
+    }, locked || !app.has_backup);
     if (app.service) item("Service status", () => openDetail(app, "status"), false);
     item("Force reinstall", () => startRun("reinstall", app.name));
     item("Remove from registry", () => {
@@ -470,6 +497,13 @@ function showSettings(settings) {
     settings.next_check * 1000 <= Date.now() ? "A check is due when Binup is idle." :
       "Next check: " + new Date(settings.next_check * 1000).toLocaleString();
 }
+$("clear-backups").addEventListener("click", () => {
+  if (busy()) return;
+  const count = state.apps.filter(app => app.has_backup).length;
+  if (!count || !confirm("Delete saved .bak rollback files for " + count + " registered app(s)? This cannot be undone.")) return;
+  toggleView("apps");
+  startRun("cleanup", "all");
+});
 $("schedule-form").addEventListener("submit", async e => {
   e.preventDefault();
   $("save-schedule").disabled = true;

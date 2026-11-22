@@ -132,6 +132,8 @@ class Run:
         self.id = secrets.token_hex(8)
         self.action, self.target = action, target
         self.scheduled = scheduled
+        if scheduled:
+            env = dict(env, BINUP_AUTO="1")
         self.owner = owner
         self.password_pipe = None
         self.last_sudo_pid = None
@@ -395,7 +397,7 @@ class Control:
                       signature=self.signature(item["entry"]))
         with self.lock:
             if status == "error":
-                result["problem"] = "Update failed" if action in ("update", "reinstall") else "Check failed"
+                result["problem"] = "Update failed" if item.get("mode") == "update" else "Check failed"
                 installed = item["entry"].get("version")
                 if installed and result["latest"] and result["latest"] != installed:
                     result["status"] = "available"
@@ -424,6 +426,19 @@ class Control:
                     raise
             return self.settings()
 
+    def set_policy(self, body):
+        name = self.app_name(body.get("app"))
+        key, enabled = body.get("key"), body.get("enabled")
+        if key not in ("auto_update", "keep_backup") or type(enabled) is not bool:
+            raise RequestError(400, "Choose a valid per-app setting and boolean value.")
+        with self.lock:
+            if self.stopping or any(run.summary()["code"] is None for run in self.runs.values()):
+                raise RequestError(409, "Wait until the current run finishes.")
+            result = self.command("policy", name, key, "on" if enabled else "off")
+        if result.returncode:
+            raise RequestError(409, result.stderr.strip() or "Could not save app settings.")
+        return dict(app=name, key=key, enabled=enabled)
+
     def check_schedule(self):
         now = time.time()
         with self.lock:
@@ -434,7 +449,7 @@ class Control:
                 return
             self.retry_after = now + 60
             try:
-                self.start_locked("check", "all", ["check", "all"], scheduled=True)
+                self.start_locked("auto", "all", ["auto", "all"], scheduled=True)
                 self.web["next_check"] = now + self.web["interval_hours"] * 3600
                 self.save_web()
             except OSError as exc:
@@ -490,9 +505,9 @@ class Control:
 
     def begin(self, body):
         action = body.get("action")
-        if action not in ("add", "edit", "check", "update", "reinstall", "remove", "start", "stop", "restart"):
+        if action not in ("add", "edit", "check", "update", "reinstall", "cleanup", "remove", "start", "stop", "restart"):
             raise RequestError(400, "Unknown action.")
-        target = self.app_name(body.get("app"), new=action == "add", all_apps=action in ("check", "update"))
+        target = self.app_name(body.get("app"), new=action == "add", all_apps=action in ("check", "update", "cleanup"))
         if action in ("start", "stop", "restart"):
             argv = ["service", target, action]
         elif action == "reinstall":
@@ -596,6 +611,8 @@ class Handler(BaseHTTPRequestHandler):
             return dict(output=result.stdout + result.stderr, code=result.returncode)
         if method == "POST" and path == "/api/settings":
             return control.set_interval(self.body().get("interval_hours"))
+        if method == "POST" and path == "/api/app-settings":
+            return control.set_policy(self.body())
         if method == "POST" and path == "/api/history/clear":
             self.body()
             return control.clear_history()

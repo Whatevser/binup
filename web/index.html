@@ -32,7 +32,7 @@
             <button id="check-all">Check all</button><button id="update-all">Update all</button><button id="add" class="primary">Add app</button>
           </div>
         </div>
-        <div class="table-wrap"><table><thead><tr><th>Application</th><th>Version</th><th>Service</th><th>State</th><th class="end">Actions</th></tr></thead><tbody id="apps"></tbody></table></div>
+        <div class="table-wrap"><table><thead><tr><th>Application</th><th>Version</th><th>Service</th><th>State</th><th>Auto-update</th><th class="end">Actions</th></tr></thead><tbody id="apps"></tbody></table></div>
         <p class="empty" id="apps-empty" hidden></p>
       </div>
     </section>
@@ -41,11 +41,12 @@
     </section>
     <section id="settings-view" aria-label="Settings" hidden>
       <form id="schedule-form"><label for="interval">Automatic update checks</label>
-        <p id="interval-hint">Check all registered apps in the background. Install updates with the Update button.</p>
+        <p id="interval-hint">Check every app on this schedule. Apps with Auto-update enabled install verified releases automatically; the others are checked only.</p>
         <div class="settings-controls"><select id="interval" aria-describedby="interval-hint"><option value="0">Off</option><option value="1">Every hour</option><option value="6">Every 6 hours</option><option value="12">Every 12 hours</option><option value="24">Every day</option></select>
           <button class="primary" id="save-schedule">Save</button></div>
         <p id="schedule-status" role="status"></p>
       </form>
+      <div class="backup-settings"><h2>Rollback backups</h2><p>Each update keeps one <code>.bak</code> copy by default. Change retention in an app's More menu, or delete existing backups now.</p><button id="clear-backups" type="button">Clear all backups</button></div>
     </section>
     <section class="output" aria-label="Live command output">
       <div class="output-head"><div class="output-heading"><h2>Live output</h2><span id="run-badge" class="badge muted">Idle</span></div>

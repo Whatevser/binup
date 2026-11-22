@@ -387,6 +387,83 @@ class ServiceTests(unittest.TestCase):
             detail = self.api(path + "?after=" + str(detail["cursor"]))
         return self.api(path)
 
+    def test_per_app_policy_and_backup_cleanup(self):
+        original = b"#!/bin/sh\n# previous version\nexit 0\n"
+        self.binary.write_bytes(original)
+        self.binary.chmod(0o755)
+        self.config.write_text(json.dumps({"demo": dict(repo="org/app", bin=str(self.binary),
+                                                       version="v0", asset_regex="linux")}))
+        # Legacy apps are checked, not installed, by an unattended pass.
+        self.cli("auto", "demo", code=10)
+        self.assertEqual(self.binary.read_bytes(), original)
+        self.cli("policy", "demo", "auto_update", "on")
+        self.cli("policy", "demo", "keep_backup", "on")
+        self.cli("auto", "demo")
+        self.assertEqual(self.binary.read_bytes(), PAYLOAD)
+        backup = Path(str(self.binary) + ".bak")
+        self.assertEqual(backup.read_bytes(), original)
+        self.assertTrue(self.record()["auto_update"])
+        self.assertTrue(self.record()["keep_backup"])
+        self.assertTrue(json.loads(self.cli("list", "--json"))[0]["has_backup"])
+        self.cli("cleanup", "demo")
+        self.assertFalse(backup.exists())
+        self.cli("cleanup", "all")  # Repeated cleanup is safe.
+        self.cli("policy", "demo", "keep_backup", "off")
+        self.binary.write_bytes(original)
+        self.cli("update", "demo")
+        self.assertEqual(self.binary.read_bytes(), PAYLOAD)
+        self.assertFalse(backup.exists())
+        self.assertFalse(self.record()["keep_backup"])
+        self.cli("policy", "demo", "auto_update", "off")
+        self.assertFalse(self.record()["auto_update"])
+        self.cli("policy", "demo", "bogus", "on", code=1)
+        self.cli("policy", "demo", "auto_update", "maybe", code=1)
+        sentinel = self.root / "sentinel"
+        sentinel.write_text("leave untouched")
+        backup.symlink_to(sentinel)
+        self.cli("cleanup", "demo", code=1)
+        self.assertEqual(sentinel.read_text(), "leave untouched")
+
+    def test_web_per_app_scheduled_install(self):
+        old = b"#!/bin/sh\n# old build\nexit 0\n"
+        automatic = self.root / "auto tool"
+        manual = self.root / "manual tool"
+        for binary in (automatic, manual):
+            binary.write_bytes(old)
+            binary.chmod(0o755)
+        self.config.write_text(json.dumps({
+            "automatic": dict(repo="org/app", bin=str(automatic), version="v0", asset_regex="linux"),
+            "manual": dict(repo="org/app", bin=str(manual), version="v0", asset_regex="linux")
+        }))
+        self.start_server("--port", "0")
+        with self.assertRaises(HTTPError):
+            self.api("app-settings", {"app": "automatic", "key": "auto_update", "enabled": 1})
+        self.assertTrue(self.api("app-settings", {"app": "automatic", "key": "auto_update",
+                                                    "enabled": True})["enabled"])
+        self.api("app-settings", {"app": "automatic", "key": "keep_backup", "enabled": False})
+        apps = {app["name"]: app for app in self.api("state")["apps"]}
+        self.assertTrue(apps["automatic"]["auto_update"])
+        self.assertFalse(apps["automatic"]["keep_backup"])
+        self.assertFalse(apps["manual"]["auto_update"])
+        self.api("settings", {"interval_hours": 6})
+        deadline = time.monotonic() + 12
+        while True:
+            runs = self.api("state")["runs"]
+            if runs and runs[0]["scheduled"]:
+                break
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.05)
+        result = self.finish_run(runs[0])
+        self.assertEqual(result["action"], "auto")
+        self.assertEqual(result["code"], 10)
+        self.assertEqual(automatic.read_bytes(), PAYLOAD)
+        self.assertEqual(manual.read_bytes(), old)
+        self.assertFalse(Path(str(automatic) + ".bak").exists())
+        apps = {app["name"]: app for app in self.api("state")["apps"]}
+        self.assertEqual(apps["automatic"]["check"]["status"], "current")
+        self.assertEqual(apps["manual"]["check"]["status"], "available")
+        self.assertFalse(apps["automatic"]["has_backup"])
+
     def test_scheduled_checks_and_version_results(self):
         self.binary.write_bytes(PAYLOAD)
         self.binary.chmod(0o755)
