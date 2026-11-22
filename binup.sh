@@ -1086,7 +1086,7 @@ ensure_registry() {
   [[ ! -L $target && ( ! -e $target || -f $target ) ]] ||
     { fail "Not a regular Binup registry: $target"; return 1; }
   if [[ ! -e $target ]]; then
-    (umask 077; printf '{}\\n' > "$target") || return 1
+    (umask 077; printf '{}\n' > "$target") || return 1
   fi
 }
 
