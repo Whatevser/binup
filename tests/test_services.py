@@ -388,7 +388,7 @@ class ServiceTests(unittest.TestCase):
         return self.api(path)
 
     def test_per_app_policy_and_backup_cleanup(self):
-        original = b"#!/bin/sh\\n# previous version\\nexit 0\\n"
+        original = b"#!/bin/sh\n# previous version\nexit 0\n"
         self.binary.write_bytes(original)
         self.binary.chmod(0o755)
         self.config.write_text(json.dumps({"demo": dict(repo="org/app", bin=str(self.binary),
@@ -425,7 +425,7 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(sentinel.read_text(), "leave untouched")
 
     def test_web_per_app_scheduled_install(self):
-        old = b"#!/bin/sh\\n# old build\\nexit 0\\n"
+        old = b"#!/bin/sh\n# old build\nexit 0\n"
         automatic = self.root / "auto tool"
         manual = self.root / "manual tool"
         for binary in (automatic, manual):
