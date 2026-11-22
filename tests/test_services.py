@@ -273,7 +273,7 @@ class ServiceTests(unittest.TestCase):
                       self.cli("web-install", str(self.config), code=1))
         self.cli("web-uninstall")
         self.assertFalse(unit.exists())
-        unit.write_text("[Service]\\nExecStart=/bin/sleep infinity\\n")
+        unit.write_text("[Service]\nExecStart=/bin/sleep infinity\n")
         self.assertIn("belongs to another service", self.cli("web-install", code=1))
         self.assertIn("/bin/sleep", unit.read_text())
 
@@ -323,7 +323,7 @@ class ServiceTests(unittest.TestCase):
         before_unit = unit.read_bytes()
         self.assertIn(str(stable / "binup_web.py"), before_unit.decode())
         self.assertIn(str(persistent), before_unit.decode())
-        persistent.write_text('{"saved":{"repo":"org/app","bin":"/tmp/test","custom":true}}\\n')
+        persistent.write_text('{"saved":{"repo":"org/app","bin":"/tmp/test","custom":true}}\n')
         web = persistent.with_name("binup.json.web.json")
         web.write_text('{"interval_hours":6,"next_check":null,"checks":{}}')
         progress = persistent.with_name("binup.json.self-update.json")
