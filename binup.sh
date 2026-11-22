@@ -20,7 +20,9 @@
 # updates reopen the picker if a rule matches zero or several release files.
 # In asset_regex, {tag} matches the full tag and {version} drops its leading v.
 #
-# Config: binup.json beside the script, or BINUP_CONF. GITHUB_TOKEN is optional.
+# Config: ~/.config/binup/binup.json (or $XDG_CONFIG_HOME/binup/binup.json).
+# BINUP_CONF overrides the CLI location; install/web-install migrate it to this
+# persistent location. GITHUB_TOKEN is optional.
 # Run as your normal user. System units and protected destinations may need sudo.
 # Requires Bash, curl, jq, flock, Python 3 and GNU coreutils. Optional tar
 # compressors such as zstd must be installed to read those formats.
@@ -33,7 +35,10 @@ set -uo pipefail
 
 SELF=$(readlink -f -- "${BASH_SOURCE[0]}") || exit 1
 LAUNCHER=$(realpath -ms -- "${BASH_SOURCE[0]}") || exit 1
-CONF=$(realpath -m -- "${BINUP_CONF:-${LAUNCHER%/*}/binup.json}") || exit 1
+PERSISTENT_CONF="${XDG_CONFIG_HOME:-$HOME/.config}/binup/binup.json"
+PERSISTENT_RUNTIME="${XDG_DATA_HOME:-$HOME/.local/share}/binup"
+CONF=$(realpath -m -- "${BINUP_CONF:-$PERSISTENT_CONF}") || exit 1
+SOURCE_CONF=''
 API=https://api.github.com
 
 # The web runner is a new session leader. Acquiring its private terminal gives
@@ -1073,7 +1078,7 @@ PY
 }
 
 cockpit_package() {
-  local action=$1 source=${SELF%/*}/web folder="${XDG_DATA_HOME:-$HOME/.local/share}/cockpit" link
+  local action=$1 source="$PERSISTENT_RUNTIME/current/web" folder="${XDG_DATA_HOME:-$HOME/.local/share}/cockpit" link
   link=$folder/binup
   if [[ $action == install ]] && ! command -v cockpit-bridge >/dev/null &&
      [[ ! -e /usr/share/cockpit/shell/manifest.json && ! -x /usr/lib/cockpit/cockpit-ws && ! -x /usr/libexec/cockpit-ws ]]; then
@@ -1094,6 +1099,67 @@ cockpit_package() {
   ok 'Cockpit page installed for this user. Open System → Binup in the left menu.'
 }
 
+
+# Never overwrite an unrelated configuration. Copy first; delete legacy files
+# only after the new web service starts and points to the persistent registry.
+prepare_config_migration() {
+  local source=$1 target=$2 suffix from to draft
+  mkdir -p -m 0700 -- "${target%/*}" || return 1
+  if [[ $source != "$target" ]]; then
+    for suffix in '' '.web.json' '.self-update.json'; do
+      from=$source$suffix; to=$target$suffix
+      [[ -e $from || -L $from ]] || continue
+      [[ -f $from && ! -L $from ]] ||
+        { fail "Not a regular config file: $from"; return 1; }
+      if [[ -e $to || -L $to ]]; then
+        [[ -f $to && ! -L $to ]] && cmp -s -- "$from" "$to" ||
+          { fail "Config conflict at $to. Resolve it before upgrading; nothing was overwritten."; return 1; }
+      else
+        draft=$(mktemp -- "$to.XXXXXXXX") || return 1
+        if ! cp -p -- "$from" "$draft" || ! mv -fT -- "$draft" "$to"; then
+          rm -f -- "$draft"
+          return 1
+        fi
+        ok "Copied $from to $to."
+      fi
+    done
+  fi
+  if [[ ! -e $target && ! -L $target ]]; then
+    (umask 077; printf '{}\\n' > "$target") || return 1
+  fi
+  [[ -f $target && ! -L $target ]] || { fail "Invalid registry path: $target"; return 1; }
+  jq -e 'type == "object" and all(.[]; type == "object")' "$target" >/dev/null ||
+    { fail "Invalid migrated registry: $target"; return 1; }
+}
+
+finish_config_migration() {
+  local source=$1 target=$2 suffix from to
+  [[ $source != "$target" ]] || return 0
+  for suffix in '' '.web.json' '.self-update.json'; do
+    from=$source$suffix; to=$target$suffix
+    [[ -f $from && ! -L $from ]] || continue
+    if cmp -s -- "$from" "$to"; then
+      rm -- "$from" || warn "Could not remove old config: $from"
+    else
+      warn "Old config changed during migration; retained for review: $from"
+    fi
+  done
+}
+
+# Replace a symlink in one rename: systemd and Cockpit see either the old
+# complete runtime or the new complete runtime, never a half-installed tree.
+switch_runtime() {
+  local root=$1 destination=$2 link=$root/current draft
+  mkdir -p -- "$root" || return 1
+  if [[ -e $link && ! -L $link ]]; then
+    fail "Unmanaged runtime path blocks Binup: $link"; return 1
+  fi
+  draft=$(mktemp -d -- "$root/.current.XXXXXXXX") || return 1
+  rmdir -- "$draft" || return 1
+  ln -s -- "$destination" "$draft" || return 1
+  mv -fT -- "$draft" "$link" || { rm -f -- "$draft"; return 1; }
+}
+
 # A loose script can fetch a complete, matching runtime without Git. Old
 # snapshots also let an already-running command finish with its original files.
 install_latest() (
@@ -1105,11 +1171,11 @@ install_latest() (
     if [[ $origin =~ ^(https://github\.com/|git@github\.com:)Whatevser/binup(\.git)?/?$ ]]; then
       [[ $(git -C "$directory" branch --show-current) == main ]] || { fail 'Run web-install for this checkout, or switch to main to upgrade.'; return 1; }
       git -C "$directory" fetch origin main || return 1
-      if [[ $CONF == "$directory/binup.json" && -f $CONF ]] && ! git -C "$directory" diff --quiet HEAD FETCH_HEAD -- binup.json; then
+      if [[ $SOURCE_CONF == "$directory/binup.json" && -f $SOURCE_CONF ]] && ! git -C "$directory" diff --quiet HEAD FETCH_HEAD -- binup.json; then
         fail "Upstream also changed binup.json. Keep your live config when merging this checkout."; return 1
       fi
       git -C "$directory" merge --ff-only FETCH_HEAD || return 1
-      bash "$launcher" web-install "$CONF"; return
+      bash "$launcher" web-install "${SOURCE_CONF:-$CONF}"; return
     fi
   fi
   mkdir -p -- "$store" || return 1
@@ -1132,15 +1198,13 @@ install_latest() (
     bash -n "$temp/code/binup.sh" && jq -e '."x-binup-package" == true' "$temp/code/web/manifest.json" >/dev/null &&
       mv -T -- "$temp/code" "$release" || return 1
   fi
-  bash "$release/binup.sh" web-install "$CONF" || return 1
-  if [[ $directory != "$release" && $directory != "$store/"* ]]; then
-    ln -sfnT -- "$release/binup.sh" "$launcher" || return 1
-    ok "Updated $launcher."
-  fi
+  bash "$release/binup.sh" web-install "${SOURCE_CONF:-$CONF}" || return 1
+  ok "Installed Binup ${revision:0:7}. Future updates are available in the web Settings page."
 )
 
 web_setup() (
   local action=$1 config_path=$2 folder unit path draft='' previous='' load base=${SELF%/*} python existing=0 asset
+  local stable="$PERSISTENT_RUNTIME/current" old_runtime='' switched=0
   (( EUID != 0 )) || { fail 'Run web setup as the user who owns the apps.'; return 1; }
   folder=$(unit_dir user) || return 1
   unit=binup-web.service; path=$folder/$unit
@@ -1162,13 +1226,23 @@ web_setup() (
     [[ -f $base/web/$asset ]] || { fail "Missing web/$asset. Run bash binup.sh install to get the complete release."; return 1; }
   done
   config_path=$(realpath -m -- "$config_path") || return 1
+  prepare_config_migration "$config_path" "$PERSISTENT_CONF" || return 1
   python=$(type -P python3) || return 1
   mkdir -p -- "$folder" || return 1
   draft=$(mktemp -- "$folder/.binup-web.XXXXXXXX") || return 1
   trap 'rm -f -- "$draft" "$previous"' EXIT
+  if [[ -L $stable ]]; then
+    old_runtime=$(readlink -- "$stable") || return 1
+  elif [[ -e $stable ]]; then
+    fail "Unmanaged runtime path blocks Binup: $stable"; return 1
+  fi
+  if [[ $old_runtime != "$base" ]]; then
+    switch_runtime "$PERSISTENT_RUNTIME" "$base" || return 1
+    switched=1
+  fi
   {
     say '# Generated by binup web-install'
-    unit_text "$unit" user '~' "$python" argv "$base/binup_web.py" serve --config "$config_path" || return 1
+    unit_text "$unit" user '~' "$python" argv "$stable/binup_web.py" serve --config "$PERSISTENT_CONF" || return 1
     printf '\n[Service]\nKillMode=mixed\nTimeoutStopSec=5min\n'
   } > "$draft" || return 1
   chmod 0644 -- "$draft" || return 1
@@ -1180,6 +1254,13 @@ web_setup() (
   # A self-update must not strand the web interface on a broken new revision.
   rollback_web_unit() {
     warn 'Restoring the previous web service after an unsuccessful upgrade.'
+    if (( switched )); then
+      if [[ -n $old_runtime ]]; then
+        switch_runtime "$PERSISTENT_RUNTIME" "$old_runtime" || return 1
+      else
+        rm -f -- "$stable" || return 1
+      fi
+    fi
     if (( existing )); then
       mv -fT -- "$previous" "$path" || return 1
     else
@@ -1203,9 +1284,10 @@ web_setup() (
     rollback_web_unit
     return 1
   fi
+  finish_config_migration "$config_path" "$PERSISTENT_CONF"
   ok "Open http://<LAN-or-VPN-IP>:9098/ on your private network."
-  say "Config: $config_path"
-  cockpit_package install
+  say "Config: $PERSISTENT_CONF"
+  cockpit_package install || warn 'Cockpit integration was not installed; the standalone UI is available.'
 )
 
 FORCE=0
@@ -1219,13 +1301,26 @@ case ${1:-} in
   web-token) say 'Open Binup using your local server address or Cockpit. No token is required.'; exit 0 ;;
   web-uninstall) web_setup "$1" "$CONF"; exit $? ;;
   install|web-install)
-    if [[ -n ${2:-} ]]; then CONF=$(realpath -m -- "$2") || exit 1
-    elif [[ -z ${BINUP_CONF:-} ]]; then
+    if [[ -n ${2:-} ]]; then
+      SOURCE_CONF=$(realpath -m -- "$2") || exit 1
+    else
       saved_config=$(installed_web_config) || exit 1
-      if [[ -n $saved_config ]]; then CONF=$(realpath -m -- "$saved_config") || exit 1; fi
+      if [[ -n $saved_config ]]; then
+        SOURCE_CONF=$(realpath -m -- "$saved_config") || exit 1
+      elif [[ -n ${BINUP_CONF:-} ]]; then
+        SOURCE_CONF=$(realpath -m -- "$BINUP_CONF") || exit 1
+      elif [[ -f ${LAUNCHER%/*}/binup.json ]]; then
+        SOURCE_CONF=$(realpath -m -- "${LAUNCHER%/*}/binup.json") || exit 1
+      else
+        SOURCE_CONF=$(realpath -m -- "$PERSISTENT_CONF") || exit 1
+      fi
     fi
-    [[ -d ${CONF%/*} && -w ${CONF%/*} && ( ! -e $CONF || -f $CONF ) ]] ||
-      { warn "Choose a config file in a directory you can write: $CONF"; exit 1; } ;;
+    [[ ( ! -e $SOURCE_CONF || -f $SOURCE_CONF ) && ! -L $SOURCE_CONF ]] ||
+      { warn "Choose a regular config file: $SOURCE_CONF"; exit 1; }
+    CONF=$(realpath -m -- "$PERSISTENT_CONF") || exit 1
+    [[ ! -e $CONF || -f $CONF ]] || { warn "Unusable persistent registry path: $CONF"; exit 1; }
+    [[ -d ${CONF%/*} && -w ${CONF%/*} ]] || mkdir -p -m 0700 -- "${CONF%/*}" || exit 1
+    ;;
 esac
 for dep in curl jq flock python3 sha256sum; do
   command -v "$dep" >/dev/null || { warn "Missing dependency: $dep"; exit 1; }
@@ -1249,7 +1344,7 @@ case ${1:-} in
   install) install_latest ;;
   remote-revision) gh 'repos/Whatevser/binup/git/ref/heads/main' |
       jq -er '.object | select(.type == "commit") | .sha | select(test("^[0-9a-f]{40}$"))' ;;
-  web-install) web_setup "$1" "$CONF" ;;
+  web-install) web_setup "$1" "$SOURCE_CONF" ;;
   remove|rm) [[ -n ${2:-} ]] && mutate remove_app "$2" || exit 1 ;;
   *)         fail "Unknown command '$1'. Try --help." ;;
 esac
