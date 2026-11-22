@@ -37,6 +37,11 @@ def mock_command(tool, args):
         else:
             print((root / "release.json").read_text())
         return 0
+    if tool == "systemd-run":
+        if (root / "fail-systemd-run").exists():
+            print("Could not start transient user unit", file=sys.stderr)
+            return 1
+        return 0  # API launch is tested separately from the worker process.
     if tool == "journalctl":
         since = next((float(a.split("@", 1)[1]) for a in args if a.startswith("--since=@")), None)
         journal = root / "journal"
@@ -100,7 +105,8 @@ def mock_command(tool, args):
             time.sleep(1.2)
         if op == "stop" and (root / "fail-stop").exists():
             return 1
-        if op != "stop" and (root / "fail-start").exists():
+        if op != "stop" and ((root / "fail-start").exists() or (root / "fail-start-once").exists()):
+            (root / "fail-start-once").unlink(missing_ok=True)
             state_file.write_text("failed")
             print("service exited with status 1", file=sys.stderr)
             return 1
@@ -122,7 +128,7 @@ class ServiceTests(unittest.TestCase):
         self.root = Path(tmp.name)
         tools = self.root / "tools"
         tools.mkdir()
-        for tool in ("curl", "systemctl", "journalctl", "sudo"):
+        for tool in ("curl", "systemctl", "journalctl", "sudo", "systemd-run"):
             file = tools / tool
             file.write_text("#!/bin/sh\nexec " + shlex.join([sys.executable, str(Path(__file__).resolve()), "--mock", tool]) + ' "$@"\n')
             file.chmod(0o755)
@@ -354,6 +360,67 @@ class ServiceTests(unittest.TestCase):
         req = Request(self.base + "/api/" + path, data=data, headers={"Content-Type": "application/json", **headers})
         with urlopen(req, timeout=18) as result:
             return json.load(result)
+
+    def test_self_update_api_and_restart_persistence(self):
+        self.start_server("--port", "0")
+        revision = "a" * 40
+        (self.root / "main-revision").write_text(revision)
+        status = self.api("self-update?check=1")
+        self.assertEqual(status["latest"], revision)
+        self.assertFalse(status.get("state"))
+        start = self.api("self-update", {})
+        self.assertEqual(start["state"], "queued")
+        self.assertIn("systemd-run", (self.root / "calls").read_text())
+        self.assertIn("self-update-worker", (self.root / "calls").read_text())
+        self.assertIn(str(self.config), (self.root / "calls").read_text())
+        for path, body in (("self-update", {}), ("runs", {"action": "add", "app": "blocked"})):
+            with self.assertRaises(HTTPError) as error:
+                self.api(path, body)
+            self.assertEqual(error.exception.code, 409)
+        status_file = self.config.with_name(self.config.name + ".self-update.json")
+        self.stop_server(self.web_process)
+        self.start_server("--port", "0")
+        self.assertEqual(self.api("self-update")["state"], "queued")
+        self.assertTrue(status_file.is_file())
+        status_file.write_text(json.dumps({"state": "success", "finished": time.time(),
+                                           "message": "Updated", "output": "All good"}))
+        self.assertEqual(self.api("self-update")["output"], "All good")
+        (self.root / "fail-systemd-run").touch()
+        with self.assertRaises(HTTPError) as failure:
+            self.api("self-update", {})
+        self.assertEqual(failure.exception.code, 503)
+        self.assertEqual(self.api("self-update")["state"], "error")
+
+    def test_self_update_worker_success_and_failure(self):
+        sys.path.insert(0, str(ROOT))
+        try:
+            import binup_web
+        finally:
+            sys.path.pop(0)
+        old_script = binup_web.SCRIPT
+        self.addCleanup(setattr, binup_web, "SCRIPT", old_script)
+        fake_script = self.root / "fake-update.sh"
+        binup_web.SCRIPT = str(fake_script)
+        fake_script.write_text('#!/bin/bash\\nprintf "Upgraded %s\\n" "$2"\\nexit 0\\n')
+        self.assertEqual(binup_web.self_update_worker(self.config), 0)
+        status = binup_web.read_update_status(binup_web.self_update_path(self.config))
+        self.assertEqual(status["state"], "success")
+        self.assertIn(str(self.config), status["output"])
+        self.assertEqual(status["code"], 0)
+        fake_script.write_text('#!/bin/bash\\necho "Upgrade rejected"\\nexit 22\\n')
+        self.assertEqual(binup_web.self_update_worker(self.config), 1)
+        status = binup_web.read_update_status(binup_web.self_update_path(self.config))
+        self.assertEqual(status["state"], "error")
+        self.assertEqual(status["code"], 22)
+        self.assertIn("Upgrade rejected", status["output"])
+
+    def test_failed_web_upgrade_restores_previous_unit(self):
+        self.cli("web-install")
+        old_unit = self.unit().with_name("binup-web.service").read_bytes()
+        (self.root / "fail-start-once").touch()
+        self.cli("web-install", code=1)
+        self.assertEqual(self.unit().with_name("binup-web.service").read_bytes(), old_unit)
+        self.assertEqual((self.root / "user-binup-web.service.state").read_text(), "active")
 
     def test_local_network_policy(self):
         sys.path.insert(0, str(ROOT))
