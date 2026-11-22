@@ -1231,6 +1231,8 @@ web_setup() (
   python=$(type -P python3) || return 1
   mkdir -p -- "$folder" || return 1
   draft=$(mktemp -- "$folder/.binup-web.XXXXXXXX") || return 1
+  _BINUP_DRAFT=$draft
+  _BINUP_PREVIOUS_UNIT=''
   # Shell EXIT traps outlive a function's local variables. Track runtime
   # recovery in subshell globals so any early failure still restores current.
   _BINUP_SWAPPED=0
@@ -1245,8 +1247,8 @@ web_setup() (
         rm -f -- "$PERSISTENT_RUNTIME/current" || :
       fi
     fi
-    [[ -z ${draft:-} ]] || rm -f -- "$draft"
-    [[ -z ${previous:-} ]] || rm -f -- "$previous"
+    [[ -z ${_BINUP_DRAFT:-} ]] || rm -f -- "$_BINUP_DRAFT"
+    [[ -z ${_BINUP_PREVIOUS_UNIT:-} ]] || rm -f -- "$_BINUP_PREVIOUS_UNIT"
   ' EXIT
   if [[ -L $stable ]]; then
     old_runtime=$(readlink -- "$stable") || return 1
@@ -1267,6 +1269,7 @@ web_setup() (
   chmod 0644 -- "$draft" || return 1
   if (( existing )); then
     previous=$(mktemp -- "$folder/.binup-web-previous.XXXXXXXX") || return 1
+    _BINUP_PREVIOUS_UNIT=$previous
     cp -p -- "$path" "$previous" || return 1
     mv -fT -- "$draft" "$path" || return 1
   else ln -T -- "$draft" "$path" || return 1; fi
