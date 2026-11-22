@@ -507,7 +507,7 @@ class Control:
         action = body.get("action")
         if action not in ("add", "edit", "check", "update", "reinstall", "cleanup", "remove", "start", "stop", "restart"):
             raise RequestError(400, "Unknown action.")
-        target = self.app_name(body.get("app"), new=action == "add", all_apps=action in ("check", "update"))
+        target = self.app_name(body.get("app"), new=action == "add", all_apps=action in ("check", "update", "cleanup"))
         if action in ("start", "stop", "restart"):
             argv = ["service", target, action]
         elif action == "reinstall":
