@@ -50,6 +50,39 @@ Replace the example prefix with your actual private tunnel's routed prefix. To s
 
 The CLI and web UI can share the same registry and writer lock. Set `BINUP_CONF` to the path printed by `web-install` when using the CLI from a different checkout. The web service runs as your user. For protected paths such as `/usr/local/bin/restic` and system services, start the action in Cockpit or in the standalone UI from any allowed LAN or VPN address. A private IP or the server’s local hostname works over HTTP. When sudo asks, enter your Linux password in the masked dialog. The tab that started the run can resume it after a refresh. If you close that tab, you can cancel the run from another tab and retry. Passwords go directly to sudo’s askpass helper and are excluded from transcripts and run history. On plain HTTP, the password travels unencrypted at the HTTP layer. System journal visibility follows the account's journal permissions.
 
+### Automatic updates and rollback backup cleanup
+
+Choose **Settings → Automatic update checks** to set how often Binup checks releases.
+On the **Applications** page, each app has an **Auto-update** switch. Existing apps
+start with it **Off**; on each scheduled pass, Binup checks every app but installs
+only the apps that explicitly have Auto-update **On**. The schedule must also be
+enabled for automatic installation. Manual **Update all** still updates all apps.
+The scheduled runner never prompts for a release file: if an asset filter stops
+matching exactly one file, it reports an error and leaves the app unchanged.
+Digest verification, service health checks and rollback work as with manual updates.
+A privileged destination requires passwordless sudo for unattended installs.
+
+Successful updates normally keep the previous executable at `<binary>.bak`
+(one backup per app, overwritten on the next update). Under the app's **More**
+menu, **Keep rollback backup** can be turned Off to delete the copy **only after**
+a successful update and registry commit. The saved copy is retained on failed
+updates for rollback. **Clear saved backup** deletes a currently existing
+`.bak` without changing the installed executable. Settings → **Clear all
+backups** deletes these copies for registered apps only; neither action
+changes a running service or removes any unregistered files.
+
+Per-app options are stored in `binup.json` as `auto_update` (default `false`)
+and `keep_backup` (default `true`). Older registries need no migration.
+They can also be managed from the terminal:
+
+```bash
+bash binup.sh policy qbit auto_update on
+bash binup.sh policy qbit keep_backup off
+bash binup.sh cleanup qbit
+bash binup.sh cleanup all
+bash binup.sh auto all          # the same unattended pass used by the scheduler
+```
+
 ### CLI shortcuts
 
 ```bash
