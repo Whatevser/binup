@@ -141,6 +141,11 @@ td, .version, .run-caption, #detail-unit { overflow-wrap: anywhere; }
 .waiting { color: var(--warning); }
 .muted, .empty { color: var(--secondary); }
 .empty { padding: 1rem; }
+.auto-toggle { display: inline-flex; align-items: center; gap: .4rem; white-space: nowrap; cursor: pointer; }
+.auto-toggle input { accent-color: var(--blue); cursor: pointer; }
+.auto-toggle input:disabled { cursor: default; }
+.backup-settings { border-top: 1px solid var(--edge); margin-top: 1.6rem; padding-top: 1.2rem; }
+.backup-settings p { color: var(--secondary); margin: .55rem 0 .8rem; }
 .row-actions { justify-content: flex-end; gap: .25rem; }
 .row-actions button, .row-actions summary { border-color: transparent; }
 .row-actions details { position: relative; }
