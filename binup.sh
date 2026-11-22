@@ -1224,6 +1224,8 @@ case ${1:-} in
   service) [[ $# == 3 && $3 =~ ^(start|stop|restart)$ ]] || { warn 'Use service NAME start|stop|restart'; exit 1; }
            mutate service_command "$2" "$3" ;;
   install) install_latest ;;
+  remote-revision) gh 'repos/Whatevser/binup/git/ref/heads/main' |
+      jq -er '.object | select(.type == "commit") | .sha | select(test("^[0-9a-f]{40}$"))' ;;
   web-install) web_setup "$1" "$CONF" ;;
   remove|rm) [[ -n ${2:-} ]] && mutate remove_app "$2" || exit 1 ;;
   *)         fail "Unknown command '$1'. Try --help." ;;
