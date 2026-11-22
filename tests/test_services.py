@@ -401,13 +401,19 @@ class ServiceTests(unittest.TestCase):
         self.addCleanup(setattr, binup_web, "SCRIPT", old_script)
         fake_script = self.root / "fake-update.sh"
         binup_web.SCRIPT = str(fake_script)
-        fake_script.write_text('#!/bin/bash\\nprintf "Upgraded %s\\n" "$2"\\nexit 0\\n')
+        fake_script.write_text("""#!/bin/bash
+printf "Upgraded %s\\n" "$2"
+exit 0
+""")
         self.assertEqual(binup_web.self_update_worker(self.config), 0)
         status = binup_web.read_update_status(binup_web.self_update_path(self.config))
         self.assertEqual(status["state"], "success")
         self.assertIn(str(self.config), status["output"])
         self.assertEqual(status["code"], 0)
-        fake_script.write_text('#!/bin/bash\\necho "Upgrade rejected"\\nexit 22\\n')
+        fake_script.write_text("""#!/bin/bash
+echo "Upgrade rejected"
+exit 22
+""")
         self.assertEqual(binup_web.self_update_worker(self.config), 1)
         status = binup_web.read_update_status(binup_web.self_update_path(self.config))
         self.assertEqual(status["state"], "error")
