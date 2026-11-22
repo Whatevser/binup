@@ -1125,7 +1125,7 @@ prepare_config_migration() {
     done
   fi
   if [[ ! -e $target && ! -L $target ]]; then
-    (umask 077; printf '{}\\n' > "$target") || return 1
+    (umask 077; printf '{}\n' > "$target") || return 1
   fi
   [[ -f $target && ! -L $target ]] || { fail "Invalid registry path: $target"; return 1; }
   jq -e 'type == "object" and all(.[]; type == "object")' "$target" >/dev/null ||
