@@ -451,6 +451,18 @@ class Control:
             self.latest_revision = result.stdout.strip()
             self.latest_checked = time.time()
         status = read_update_status(self.update_file)
+        legacy = status.get("legacy_path")
+        if isinstance(legacy, str) and legacy and status.get("state") in ("queued", "running"):
+            old_path = Path(legacy)
+            old_status = read_update_status(old_path)
+            if (old_status.get("state") in ("success", "error") and
+                    old_status.get("started") == status.get("started")):
+                status = {k: v for k, v in old_status.items() if k != "legacy_path"}
+                write_update_status(self.update_file, status)
+                try:
+                    old_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
         if status.get("state") in ("queued", "running") and time.time() - status.get("started", 0) > SELF_UPDATE_TIMEOUT + 60:
             status.update(state="error", finished=time.time(), message="Self-update was interrupted or timed out.")
             write_update_status(self.update_file, status)
