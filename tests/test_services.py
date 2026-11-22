@@ -474,11 +474,35 @@ exit 22
     def test_failed_web_upgrade_restores_previous_unit(self):
         self.cli("web-install")
         old_unit = self.unit().with_name("binup-web.service").read_bytes()
+        stable = self.root / "data/binup/current"
+        previous = self.root / "previous-version"
+        previous.mkdir()
+        stable.unlink()
+        stable.symlink_to(previous)
         (self.root / "fail-start-once").touch()
         self.cli("web-install", code=1)
         self.assertEqual(self.unit().with_name("binup-web.service").read_bytes(), old_unit)
-        self.assertEqual((self.root / "data/binup/current").resolve(), ROOT)
+        self.assertEqual(stable.resolve(), previous)
         self.assertEqual((self.root / "user-binup-web.service.state").read_text(), "active")
+
+    def test_import_legacy_self_update_result_after_migration(self):
+        sys.path.insert(0, str(ROOT))
+        try:
+            from binup_web import Control, read_update_status, self_update_path
+        finally:
+            sys.path.pop(0)
+        legacy = self.root / "scripts/binup.json.self-update.json"
+        legacy.parent.mkdir()
+        status_path = self_update_path(self.config)
+        status_path.write_text(json.dumps({"state": "running", "started": 42,
+                                           "legacy_path": str(legacy)}))
+        legacy.write_text(json.dumps({"state": "success", "started": 42,
+                                      "output": "Installed new runtime", "finished": 50}))
+        summary = Control(self.config).self_update_status()
+        self.assertEqual(summary["state"], "success")
+        self.assertIn("Installed new runtime", summary["output"])
+        self.assertFalse(legacy.exists())
+        self.assertNotIn("legacy_path", read_update_status(status_path))
 
     def test_local_network_policy(self):
         sys.path.insert(0, str(ROOT))
