@@ -1303,7 +1303,7 @@ web_setup() (
   finish_config_migration "$config_path" "$PERSISTENT_CONF"
   ok "Open http://<LAN-or-VPN-IP>:9098/ on your private network."
   say "Config: $PERSISTENT_CONF"
-  cockpit_package install || warn 'Cockpit integration was not installed; the standalone UI is available.'
+  cockpit_package install
 )
 
 FORCE=0
