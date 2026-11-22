@@ -7,6 +7,9 @@
 #   bash binup.sh check [NAME]     check one or all apps, without installing
 #   bash binup.sh update NAME      update one app (-f or --force to reinstall)
 #   bash binup.sh update all       update all apps, continuing after failures
+#   bash binup.sh auto [NAME]      check all; update only opted-in apps (noninteractive)
+#   bash binup.sh policy NAME auto_update|keep_backup on|off
+#   bash binup.sh cleanup NAME|all  remove saved .bak rollback copies
 #   bash binup.sh list [--json] | remove NAME
 #   bash binup.sh status NAME | logs NAME [--follow] | service NAME start|stop|restart
 #   bash binup.sh install [CONFIG_PATH]       upgrade a loose script and install the UI
@@ -254,6 +257,11 @@ select_asset() {
     default=$(jq -r --arg n "$name" 'map(.name) | index($n) + 1' <<< "$assets")
   else
     warn "$tag has $count matches for ${rule:-automatic Linux / CPU detection}."
+  fi
+  # Scheduled updates never wait for an asset picker.
+  if [[ -n ${BINUP_AUTO:-} && $mode == update ]]; then
+    fail "Automatic update skipped: $tag has $count matching assets. Edit $app to save a unique asset rule."
+    return 1
   fi
   if [[ -n ${BINUP_PROMPT_FD:-} && $mode != check ]]; then
     options=$(jq -c 'to_entries | map({value:((.key+1)|tostring),label:.value.name})
@@ -710,7 +718,19 @@ install_build() (
   (( ! interrupted )) || return 130
   record_build || { fail "Could not commit $CONF."; return 1; }
   committed=1
-  if (( had_old )); then ok "$app updated to $tag (backup $bin.bak)."; else ok "$app installed at $bin ($tag)."; fi
+  if (( had_old )); then
+    if jq -e '.keep_backup == false' <<< "$entry" >/dev/null; then
+      if "${priv[@]}" rm -f -- "$bin.bak"; then
+        ok "$app updated to $tag (rollback backup cleared)."
+      else
+        warn "$app updated to $tag, but could not remove $bin.bak."
+      fi
+    else
+      ok "$app updated to $tag (backup $bin.bak)."
+    fi
+  else
+    ok "$app installed at $bin ($tag)."
+  fi
 )
 
 process_app() (
@@ -718,8 +738,9 @@ process_app() (
   process_build; rc=$?
   if [[ -n ${BINUP_PROMPT_FD:-} && $rc != 130 && $rc != 143 && $rc != 129 && -n $entry ]]; then
     if [[ $mode == update && $rc == 0 ]]; then entry=$(entry_for "$app") || return 1; fi
-    jq -nc --arg app "$app" --arg tag "$tag" --arg reason "$reason" --argjson entry "$entry" --argjson code "$rc" \
-      '{type:"result",app:$app,tag:$tag,reason:$reason,entry:$entry,code:$code}' >&"$BINUP_PROMPT_FD" || return 1
+    jq -nc --arg app "$app" --arg tag "$tag" --arg reason "$reason" --arg mode "$mode" \
+      --argjson entry "$entry" --argjson code "$rc" \
+      '{type:"result",app:$app,tag:$tag,reason:$reason,mode:$mode,entry:$entry,code:$code}' >&"$BINUP_PROMPT_FD" || return 1
   fi
   return "$rc"
 )
@@ -815,15 +836,66 @@ process_build() {
   fi
 }
 
-run_apps() {
-  local mode=$1 target=${2:-all} keys app rc result=0 names=() failures=()
-  if [[ $target != all ]]; then process_app "$mode" "$target"; return; fi
+# Policies are stored in the app registry and shared by CLI and web.
+set_policy() {
+  local app=$1 key=$2 setting=$3 value
+  [[ -n $app && $app != all ]] || { fail 'Specify a registered app.'; return 1; }
+  config -e --arg n "$app" 'has($n)' >/dev/null || { fail "'$app' is not registered."; return 1; }
+  case $key in auto_update|keep_backup) ;; *) fail 'Use auto_update or keep_backup.'; return 1 ;; esac
+  case $setting in on|true) value=true ;; off|false) value=false ;;
+    *) fail 'Use on or off.'; return 1 ;;
+  esac
+  save_config --arg n "$app" --arg key "$key" --argjson value "$value" '.[$n][$key] = $value' || return 1
+  ok "$app: $key = $value"
+}
+
+clear_one_backup() {
+  local app=$1 entry bin backup priv=()
+  entry=$(entry_for "$app") || return 1
+  [[ $entry != '{}' ]] || { fail "'$app' is not registered."; return 1; }
+  bin=$(field "$entry" bin)
+  [[ $bin == /* ]] || { fail "$app has no absolute binary path."; return 1; }
+  bin=$(realpath -m -- "$bin") || return 1
+  backup=$bin.bak
+  [[ ! -L $backup ]] || { fail "Refusing to remove symlink $backup."; return 1; }
+  if [[ ! -e $backup ]]; then say "$app: no backup to clear."; return 0; fi
+  [[ -f $backup ]] || { fail "$backup is not a regular file."; return 1; }
+  if (( EUID != 0 )) && [[ ! -w ${backup%/*} || ! -O $backup ]]; then priv=(as_root); fi
+  "${priv[@]}" rm -- "$backup" || { fail "Could not remove $backup."; return 1; }
+  ok "$app: removed $backup"
+}
+clear_backups() {
+  local target=$1 app keys result=0 names=()
+  if [[ $target != all ]]; then clear_one_backup "$target"; return; fi
   keys=$(config -r 'keys[]') || return 1
   [[ -n $keys ]] || { say 'No apps registered.'; return 0; }
   mapfile -t names <<< "$keys"
-  # Keep stdin attached to the terminal when an app needs a new build selection.
   for app in "${names[@]}"; do
-    process_app "$mode" "$app"; rc=$?
+    clear_one_backup "$app" || result=1
+  done
+  return "$result"
+}
+
+run_apps() {
+  local mode=$1 target=${2:-all} keys app rc result=0 names=() failures=() effective entry
+  if [[ $target != all ]]; then names=("$target")
+  else
+    keys=$(config -r 'keys[]') || return 1
+    [[ -n $keys ]] || { say 'No apps registered.'; return 0; }
+    mapfile -t names <<< "$keys"
+  fi
+  # Scheduled maintenance checks every app, installing only for explicit opt-ins.
+  for app in "${names[@]}"; do
+    effective=$mode
+    if [[ $mode == auto ]]; then
+      entry=$(entry_for "$app") || return 1
+      if jq -e '.auto_update == true' <<< "$entry" >/dev/null; then
+        effective=update
+      else
+        effective=check
+      fi
+    fi
+    process_app "$effective" "$app"; rc=$?
     case $rc in
       0) ;;
       129|130|143) warn 'Operation interrupted.'; return "$rc" ;;
