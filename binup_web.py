@@ -457,6 +457,11 @@ class Control:
         return dict(installed=self.installed_revision(), latest=self.latest_revision,
                     checked=self.latest_checked, **status)
 
+    def self_update_active(self):
+        state = read_update_status(self.update_file)
+        return (state.get("state") in ("queued", "running") and
+                time.time() - state.get("started", 0) < SELF_UPDATE_TIMEOUT + 60)
+
     def start_self_update(self):
         with self.lock:
             if self.stopping or any(run.summary()["code"] is None for run in self.runs.values()):
@@ -542,8 +547,8 @@ class Control:
         if key not in ("auto_update", "keep_backup") or type(enabled) is not bool:
             raise RequestError(400, "Choose a valid per-app setting and boolean value.")
         with self.lock:
-            if self.stopping or any(run.summary()["code"] is None for run in self.runs.values()):
-                raise RequestError(409, "Wait until the current run finishes.")
+            if self.stopping or self.self_update_active() or any(run.summary()["code"] is None for run in self.runs.values()):
+                raise RequestError(409, "Wait until the current operation finishes.")
             result = self.command("policy", name, key, "on" if enabled else "off")
         if result.returncode:
             raise RequestError(409, result.stderr.strip() or "Could not save app settings.")
@@ -553,7 +558,7 @@ class Control:
         now = time.time()
         with self.lock:
             due = self.web["next_check"]
-            if self.stopping or not due or now < max(due, self.retry_after):
+            if self.stopping or not due or now < max(due, self.retry_after) or self.self_update_active():
                 return
             if any(run.summary()["code"] is None for run in self.runs.values()):
                 return
@@ -625,6 +630,8 @@ class Control:
         else:
             argv = [action, target]
         with self.lock:
+            if self.self_update_active():
+                raise RequestError(409, "Binup is updating itself. Wait for the web service to restart.")
             if self.stopping or any(run.summary()["code"] is None for run in self.runs.values()):
                 raise RequestError(409, "A command is already running. Open its live output.")
             if action == "add" and self.web["checks"].pop(target, None) is not None:
