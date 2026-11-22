@@ -1284,6 +1284,21 @@ web_setup() (
     rollback_web_unit
     return 1
   fi
+  # An updater launched by the previous release writes its final status to
+  # the old config path after this installer exits. Let the new web process
+  # import that final status once it appears.
+  if [[ $config_path != "$PERSISTENT_CONF" && -f $PERSISTENT_CONF.self-update.json ]] &&
+     jq -e '.state == "queued" or .state == "running"' "$PERSISTENT_CONF.self-update.json" >/dev/null 2>&1; then
+    local status_tmp
+    status_tmp=$(mktemp -- "$PERSISTENT_CONF.self-update.json.XXXXXXXX") || return 1
+    if jq --arg legacy "$config_path.self-update.json" '.legacy_path = $legacy' \
+         "$PERSISTENT_CONF.self-update.json" > "$status_tmp"; then
+      mv -fT -- "$status_tmp" "$PERSISTENT_CONF.self-update.json" || return 1
+    else
+      rm -f -- "$status_tmp"
+      warn 'Could not record the legacy self-update status path.'
+    fi
+  fi
   finish_config_migration "$config_path" "$PERSISTENT_CONF"
   ok "Open http://<LAN-or-VPN-IP>:9098/ on your private network."
   say "Config: $PERSISTENT_CONF"
